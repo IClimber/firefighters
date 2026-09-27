@@ -89,7 +89,7 @@
     <span><i class="sw" style="background:#8b8b86"></i>Погашена: <b id="nX">0</b></span>
     <span><i class="sw" style="background:#22201d"></i>Згоріла: <b id="nB">0</b></span>
   </div>
-  <div class="hint">Стрілки — рух. Біля річки відро наповнюється само. Пробіл — вилити воду на палаючу ділянку, на якій стоїш.</div>
+  <div class="hint">Стрілки — рух. Біля річки відро наповнюється само. Пробіл — вилити воду на палаючу ділянку, на якій стоїш. Машина збиває на 3 секунди і виливає воду з відра.</div>
 </div>
 
 <div class="overlay" id="waitOv">
@@ -126,6 +126,25 @@ const TICK = 0.25;               // крок симуляції вогню у х
 const GRACE_MS = 3000;           // очікування інших гравців перед стартом власної гри
 const FILL_X = RIVER_W + 22;     // лівіше цієї межі відро наповнюється
 
+// Машини
+const CAR_W = W / 12;            // ширина машини (1/12 поля), смуга = 1/6
+const CAR_SPEED = 220;           // однакова для всіх машин, одиниць/сек
+const CAR_SLOT = 1.8;            // у кожній смузі не частіше ніж одна машина на слот, сек
+const CAR_JITTER = 0.4;          // випадковий зсув старту в межах слоту, сек
+const CAR_CHANCE = 0.55;         // ймовірність появи машини в слоті
+const STUN_MS = 3000;            // скільки гравець стоїть після зіткнення
+const STUN_GRACE_MS = 800;       // після оглушення коротко не збивають повторно
+const LANES = [
+  { x: ROAD_X + ROAD_W / 4, dir: 1 },       // ліва смуга — вниз
+  { x: ROAD_X + ROAD_W * 3 / 4, dir: -1 },  // права смуга — вгору
+];
+const CAR_TYPES = [
+  { kind: 'sedan', len: 160 },
+  { kind: 'suv', len: 175 },
+  { kind: 'truck', len: 250 },
+];
+const CAR_MAX_LEN = 250;
+
 // ================= Кімната з URL =================
 let roomId = location.hash.slice(1);
 if (!roomId) {
@@ -151,6 +170,11 @@ function mulberry32(a) {
     t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
     return ((t ^ t >>> 14) >>> 0) / 4294967296;
   };
+}
+function hashStr(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return h >>> 0;
 }
 function makeCanvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
 const safe = (p) => { if (p && p.catch) p.catch(() => {}); };
@@ -178,6 +202,7 @@ const me = {
   y: 240 + Math.random() * (H - 280),
   hue: Math.floor(Math.random() * 360),
   face: 1, full: false, moving: false,
+  stunUntil: 0, graceUntil: 0,
 };
 // peerId -> { t, x, y, tx, ty, hue, face, full, moving, hasPos }
 const peers = new Map();
@@ -190,7 +215,7 @@ const steamAt = new Float64Array(N);       // час, коли ділянку п
 function getPeer(id) {
   let p = peers.get(id);
   if (!p) {
-    p = { t: null, x: W / 2, y: H / 2, tx: W / 2, ty: H / 2, hue: 0, face: 1, full: false, moving: false, hasPos: false };
+    p = { t: null, x: W / 2, y: H / 2, tx: W / 2, ty: H / 2, hue: 0, face: 1, full: false, moving: false, stun: false, hasPos: false };
     peers.set(id, p);
   }
   return p;
@@ -207,6 +232,17 @@ function hostId() {
 }
 const amHost = () => hostId() === selfId;
 
+// Спільний час (годинник хоста) — від нього детерміновано рахуються машини
+let clockOffset = 0, clockFrom = null;
+const clockSamples = [];
+function sampleClock(ht, from) {
+  if (from !== clockFrom) { clockFrom = from; clockSamples.length = 0; }
+  clockSamples.push(ht - Date.now());          // = зсув - затримка, тому беремо максимум
+  if (clockSamples.length > 12) clockSamples.shift();
+  clockOffset = Math.max(...clockSamples);
+}
+const sharedNow = () => Date.now() + (amHost() ? 0 : clockOffset);
+
 // ================= P2P =================
 const room = joinRoom({ appId: 'yurii-firefighters-v1' }, roomId);
 const helloA = room.makeAction('hello');
@@ -218,10 +254,12 @@ const restartA = room.makeAction('restart');
 const myPos = () => ({
   x: Math.round(me.x), y: Math.round(me.y), h: me.hue,
   f: me.face, b: me.full ? 1 : 0, m: me.moving ? 1 : 0,
+  s: performance.now() < me.stunUntil ? 1 : 0,
 });
 const worldMsg = () => ({
   r: game.round, g: game.grid.join(''),
   a: game.ages.map(v => Math.round(v * 10) / 10), p: game.phase,
+  ht: Date.now(),
 });
 function sendWorld(target) {
   if (!game.round) return;
@@ -248,12 +286,13 @@ helloA.onMessage = (d, { peerId }) => {
 posA.onMessage = (d, { peerId }) => {
   const p = getPeer(peerId);
   if (!p.hasPos) { p.x = d.x; p.y = d.y; p.hasPos = true; }
-  p.tx = d.x; p.ty = d.y; p.hue = d.h; p.face = d.f; p.full = !!d.b; p.moving = !!d.m;
+  p.tx = d.x; p.ty = d.y; p.hue = d.h; p.face = d.f; p.full = !!d.b; p.moving = !!d.m; p.stun = !!d.s;
 };
 
 worldA.onMessage = (d, { peerId }) => {
   if (peerId !== hostId() && game.round) return;   // стан приймаємо тільки від хоста
   ready = true;
+  if (d.ht) sampleClock(d.ht, peerId);
   const grid = d.g.split('');
   if (d.r === game.round) {
     const now = performance.now();
@@ -379,7 +418,7 @@ addEventListener('keyup', (e) => keys.delete(e.key));
 addEventListener('blur', () => keys.clear());
 
 function pour() {
-  if (!me.full || game.phase !== 'play') return;
+  if (!me.full || game.phase !== 'play' || performance.now() < me.stunUntil) return;
   const i = cellAt(me.x, me.y - 4);
   if (i < 0 || game.grid[i] !== 'f') return;
   me.full = false;
@@ -665,8 +704,9 @@ function sprite(hue, frame, full) {
   spriteCache.set(key, c);
   return c;
 }
-function drawPlayer(x, y, hue, face, full, moving, mine, t) {
+function drawPlayer(x, y, hue, face, full, moving, mine, stun, t) {
   const frame = moving && Math.floor(t * 7) % 2 ? 1 : 0;
+  ctx.globalAlpha = stun && Math.floor(t * 8) % 2 ? 0.2 : 1;
   ctx.fillStyle = 'rgba(0,0,0,0.28)';
   ctx.beginPath(); ctx.ellipse(x, y, 17, 5, 0, 0, Math.PI * 2); ctx.fill();
   ctx.save();
@@ -683,6 +723,114 @@ function drawPlayer(x, y, hue, face, full, moving, mine, t) {
     ctx.beginPath(); ctx.moveTo(x - 7, ty - 8); ctx.lineTo(x + 7, ty - 8); ctx.lineTo(x, ty); ctx.closePath();
     ctx.fill(); ctx.stroke();
   }
+  ctx.globalAlpha = 1;
+}
+
+// ================= Машини =================
+// Розклад машин детермінований: залежить лише від кімнати та спільного часу,
+// тому в усіх гравців машини однакові без жодної передачі даних.
+const roadSeed = hashStr(roomId);
+function carsAt(T) {
+  const out = [];
+  const travel = (H + 2 * CAR_MAX_LEN) / CAR_SPEED;
+  for (let li = 0; li < LANES.length; li++) {
+    const lane = LANES[li];
+    const kMin = Math.floor((T - travel) / CAR_SLOT) - 1, kMax = Math.floor(T / CAR_SLOT);
+    for (let k = kMin; k <= kMax; k++) {
+      const r = mulberry32((roadSeed ^ Math.imul(li + 1, 0x9E3779B1) ^ Math.imul(k, 0x85EBCA77)) >>> 0);
+      if (r() > CAR_CHANCE) continue;
+      const t0 = k * CAR_SLOT + r() * CAR_JITTER;
+      if (t0 > T) continue;
+      const tv = r();
+      const type = CAR_TYPES[tv < 0.45 ? 0 : tv < 0.8 ? 1 : 2];
+      const hue = Math.floor(r() * 360), sat = 50 + r() * 30, lig = 36 + r() * 22;
+      const d = (T - t0) * CAR_SPEED;                 // пройдений шлях передньою частиною
+      let y1, y2;
+      if (lane.dir > 0) { y2 = d; y1 = d - type.len; } // їде вниз, стартує над полем
+      else { y1 = H - d; y2 = y1 + type.len; }        // їде вгору, стартує під полем
+      if (y2 < 0 || y1 > H) continue;
+      out.push({ x: lane.x, y1, y2, dir: lane.dir, kind: type.kind, len: type.len, hue, sat, lig });
+    }
+  }
+  return out;
+}
+
+function rr(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+// Машина малюється передом вниз (+y), для руху вгору розвертається на 180°
+function drawCar(c) {
+  const hw = CAR_W / 2, hl = c.len / 2;
+  const body = `hsl(${c.hue} ${c.sat}% ${c.lig}%)`;
+  const dark = `hsl(${c.hue} ${c.sat}% ${c.lig - 14}%)`;
+  const lite = `hsl(${c.hue} ${c.sat}% ${Math.min(80, c.lig + 14)}%)`;
+  const glass = '#26323f';
+  ctx.save();
+  ctx.translate(c.x, (c.y1 + c.y2) / 2);
+  if (c.dir < 0) ctx.rotate(Math.PI);
+
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  rr(-hw + 5, -hl + 7, CAR_W, c.len, 14); ctx.fill();
+
+  // дзеркала
+  ctx.fillStyle = dark;
+  const mirY = c.kind === 'truck' ? hl - 52 : hl - 62;
+  ctx.fillRect(-hw - 6, mirY, 7, 9);
+  ctx.fillRect(hw - 1, mirY, 7, 9);
+
+  if (c.kind === 'truck') {
+    // кузов-фургон
+    ctx.fillStyle = `hsl(${c.hue} 12% 86%)`;
+    rr(-hw, -hl, CAR_W, c.len - 78, 6); ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.18)'; ctx.lineWidth = 2;
+    for (let y = -hl + 30; y < hl - 90; y += 30) { ctx.beginPath(); ctx.moveTo(-hw + 6, y); ctx.lineTo(hw - 6, y); ctx.stroke(); }
+    // кабіна
+    ctx.fillStyle = body;
+    rr(-hw + 2, hl - 74, CAR_W - 4, 74, 14); ctx.fill();
+    ctx.fillStyle = glass;
+    rr(-hw + 9, hl - 30, CAR_W - 18, 16, 4); ctx.fill();
+    ctx.fillStyle = lite;
+    rr(-hw + 10, hl - 66, CAR_W - 20, 32, 5); ctx.fill();
+  } else {
+    const suv = c.kind === 'suv';
+    ctx.fillStyle = body;
+    rr(-hw, -hl, CAR_W, c.len, suv ? 12 : 18); ctx.fill();
+    ctx.fillStyle = dark;
+    ctx.fillRect(-hw + 4, hl - 40, CAR_W - 8, 2);        // лінія капота
+    ctx.fillRect(-hw + 4, -hl + 26, CAR_W - 8, 2);       // лінія багажника
+    // лобове скло
+    ctx.fillStyle = glass;
+    ctx.beginPath();
+    ctx.moveTo(-hw + 8, hl - 44); ctx.lineTo(hw - 8, hl - 44);
+    ctx.lineTo(hw - 13, hl - 70); ctx.lineTo(-hw + 13, hl - 70); ctx.closePath(); ctx.fill();
+    // заднє скло
+    const rear = suv ? -hl + 20 : -hl + 32;
+    ctx.beginPath();
+    ctx.moveTo(-hw + 10, rear); ctx.lineTo(hw - 10, rear);
+    ctx.lineTo(hw - 13, rear + 18); ctx.lineTo(-hw + 13, rear + 18); ctx.closePath(); ctx.fill();
+    // дах
+    ctx.fillStyle = lite;
+    rr(-hw + 12, rear + 20, CAR_W - 24, (hl - 72) - (rear + 20), 6); ctx.fill();
+    if (suv) {
+      ctx.fillStyle = dark;
+      ctx.fillRect(-hw + 14, rear + 24, 3, (hl - 78) - (rear + 24));
+      ctx.fillRect(hw - 17, rear + 24, 3, (hl - 78) - (rear + 24));
+    }
+  }
+  // фари і стопи
+  ctx.fillStyle = '#fff4c2';
+  ctx.fillRect(-hw + 6, hl - 6, 14, 5);
+  ctx.fillRect(hw - 20, hl - 6, 14, 5);
+  ctx.fillStyle = '#d42a2a';
+  ctx.fillRect(-hw + 6, -hl + 1, 12, 4);
+  ctx.fillRect(hw - 18, -hl + 1, 12, 4);
+  ctx.restore();
+}
+
+// Зіткнення: "ноги" гравця з прямокутником машини
+function hitByCar(cars) {
+  for (const c of cars) {
+    if (Math.abs(me.x - c.x) < CAR_W / 2 + 10 && me.y > c.y1 + 6 && me.y - 16 < c.y2 - 6) return true;
+  }
+  return false;
 }
 
 // ================= Рендер і ігровий цикл =================
@@ -713,11 +861,21 @@ function frame(now) {
   if (keys.has('ArrowUp')) dy -= 1;
   if (keys.has('ArrowDown')) dy += 1;
   if (dx && dy) { dx *= Math.SQRT1_2; dy *= Math.SQRT1_2; }
+  const stunned = now < me.stunUntil;
+  if (stunned) { dx = 0; dy = 0; }
   me.moving = !!(dx || dy);
   if (dx) me.face = dx > 0 ? 1 : -1;
   me.x = Math.max(RIVER_W + 10, Math.min(W - 16, me.x + dx * SPEED * dt));
   me.y = Math.max(40, Math.min(H - 4, me.y + dy * SPEED * dt));
   if (me.x <= FILL_X) me.full = true;
+
+  const cars = carsAt(sharedNow() / 1000);
+  if (!stunned && now >= me.graceUntil && game.round && hitByCar(cars)) {
+    me.stunUntil = now + STUN_MS;
+    me.graceUntil = me.stunUntil + STUN_GRACE_MS;
+    me.full = false;
+    me.moving = false;
+  }
 
   // локальне старіння вогню для анімації (у хоста це робить симуляція)
   if (!amHost() && game.phase === 'play') {
@@ -743,6 +901,8 @@ function frame(now) {
     ctx.drawImage(tiles[i][game.grid[i]], FOREST_X + (i % COLS) * CELL, Math.floor(i / COLS) * CELL, CELL, CELL);
   }
 
+  for (const c of cars) drawCar(c);
+
   // підсвітка ділянки, яку можна загасити
   const ci = cellAt(me.x, me.y - 4);
   if (me.full && ci >= 0 && game.grid[ci] === 'f' && game.phase === 'play') {
@@ -758,10 +918,10 @@ function frame(now) {
 
   // гравці, відсортовані по y
   const list = [];
-  for (const p of peers.values()) if (p.hasPos) list.push({ x: p.x, y: p.y, hue: p.hue, face: p.face, full: p.full, moving: p.moving, mine: false });
-  list.push({ x: me.x, y: me.y, hue: me.hue, face: me.face, full: me.full, moving: me.moving, mine: true });
+  for (const p of peers.values()) if (p.hasPos) list.push({ x: p.x, y: p.y, hue: p.hue, face: p.face, full: p.full, moving: p.moving, stun: p.stun, mine: false });
+  list.push({ x: me.x, y: me.y, hue: me.hue, face: me.face, full: me.full, moving: me.moving, stun: now < me.stunUntil, mine: true });
   list.sort((a, b) => a.y - b.y);
-  for (const p of list) drawPlayer(p.x, p.y, p.hue, p.face, p.full, p.moving, p.mine, t);
+  for (const p of list) drawPlayer(p.x, p.y, p.hue, p.face, p.full, p.moving, p.mine, p.stun, t);
 
   ctx.restore();
   requestAnimationFrame(frame);
