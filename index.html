@@ -2,7 +2,7 @@
 <html lang="uk">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>Firefighters</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Rubik:wght@400;600&display=swap" rel="stylesheet">
@@ -71,12 +71,55 @@
   .card p { margin: 0 0 16px; color: var(--muted); }
   .win h2 { color: var(--ok); }
   .lose h2 { color: var(--fire); }
+
+  /* ---------- Сенсорне керування ---------- */
+  :root { --pad: 150px; --btn: 100px; }
+  @media (orientation: landscape) { :root { --pad: 120px; --btn: 84px; } }
+  .controls { display: none; }
+  .touch .controls { display: block; }
+  .touch, .touch body {
+    touch-action: none; overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  }
+  .touch .title, .touch .link, .touch .hint { display: none; }
+  .touch .hud {
+    top: calc(6px + env(safe-area-inset-top));
+    width: auto; max-width: calc(100vw - 12px);
+    padding: 6px 10px; font-size: 12px;
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 4px 12px;
+  }
+  .touch .status, .touch .legend { margin-top: 0; }
+  .touch #copy { padding: 4px 10px; }
+  .touch .legend { gap: 2px 10px; justify-content: center; }
+  .dpad {
+    position: fixed;
+    left: calc(14px + env(safe-area-inset-left));
+    bottom: calc(14px + env(safe-area-inset-bottom));
+    width: var(--pad); height: var(--pad); border-radius: 50%;
+    background: rgba(255,255,255,0.16); border: 2px solid rgba(255,255,255,0.4);
+    touch-action: none;
+  }
+  .dpad svg { position: absolute; inset: 0; width: 100%; height: 100%; fill: rgba(255,255,255,0.75); pointer-events: none; }
+  .knob {
+    position: absolute; left: 31%; top: 31%; width: 38%; height: 38%; border-radius: 50%;
+    background: rgba(255,255,255,0.5); pointer-events: none;
+  }
+  .pour {
+    position: fixed;
+    right: calc(14px + env(safe-area-inset-right));
+    bottom: calc(24px + env(safe-area-inset-bottom));
+    width: var(--btn); height: var(--btn); padding: 0; border-radius: 50%;
+    background: #2f8fd8e6; border: 3px solid #ffffff99; color: #fff; font-size: 15px;
+    touch-action: none;
+  }
+  .pour.empty { background: #55606be0; }
+  .pour.pressed { transform: scale(0.93); }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
 
-<div class="hud">
+<div class="hud" id="hud">
   <h1 class="title">FIREFIGHTERS</h1>
   <div class="row">
     <input class="link" id="link" readonly aria-label="Посилання на гру">
@@ -90,6 +133,19 @@
     <span><i class="sw" style="background:#22201d"></i>Згоріла: <b id="nB">0</b></span>
   </div>
   <div class="hint">Стрілки — рух. Біля річки відро наповнюється само. Пробіл — вилити воду на палаючу ділянку, на якій стоїш. Машина збиває на 3 секунди і виливає воду з відра.</div>
+</div>
+
+<div class="controls" aria-hidden="true">
+  <div class="dpad" id="dpad">
+    <svg viewBox="0 0 100 100">
+      <path d="M50 9 L61 24 L39 24Z"/>
+      <path d="M50 91 L61 76 L39 76Z"/>
+      <path d="M9 50 L24 39 L24 61Z"/>
+      <path d="M91 50 L76 39 L76 61Z"/>
+    </svg>
+    <div class="knob" id="knob"></div>
+  </div>
+  <button class="pour" id="pourBtn">Вилити</button>
 </div>
 
 <div class="overlay" id="waitOv">
@@ -145,6 +201,11 @@ const CAR_TYPES = [
 ];
 const CAR_MAX_LEN = 250;
 
+// Сенсорний пристрій: основний вказівник — палець
+const isTouch = matchMedia('(pointer: coarse)').matches;
+if (isTouch) document.documentElement.classList.add('touch');
+const COPY_LABEL = isTouch ? 'Копіювати посилання' : 'Копіювати';
+
 // ================= Кімната з URL =================
 let roomId = location.hash.slice(1);
 if (!roomId) {
@@ -154,12 +215,13 @@ if (!roomId) {
 const linkEl = document.getElementById('link');
 const copyBtn = document.getElementById('copy');
 linkEl.value = location.href;
+copyBtn.textContent = COPY_LABEL;
 copyBtn.onclick = async () => {
   try { await navigator.clipboard.writeText(location.href); }
   catch { linkEl.select(); document.execCommand('copy'); }
   copyBtn.textContent = 'Скопійовано';
   copyBtn.blur();
-  setTimeout(() => copyBtn.textContent = 'Копіювати', 1500);
+  setTimeout(() => copyBtn.textContent = COPY_LABEL, 1500);
 };
 
 // ================= Утиліти =================
@@ -198,7 +260,7 @@ function cellAt(x, y) {
 // ================= Стан =================
 const joinedAt = Date.now();
 const me = {
-  x: SHOULDER_X + 40 + Math.random() * (SHOULDER_W + ROAD_W - 80),
+  x: SHOULDER_X + 30 + Math.random() * (SHOULDER_W - 60),   // з'являємось на обочині, не на дорозі
   y: 240 + Math.random() * (H - 280),
   hue: Math.floor(Math.random() * 360),
   face: 1, full: false, moving: false,
@@ -415,7 +477,61 @@ addEventListener('keydown', (e) => {
   if (e.code === 'Space') { e.preventDefault(); if (!e.repeat) pour(); }
 });
 addEventListener('keyup', (e) => keys.delete(e.key));
-addEventListener('blur', () => keys.clear());
+
+// Сенсорні контроли додають "натиснуті стрілки" в окремий набір
+const touchKeys = new Set();
+const held = (k) => keys.has(k) || touchKeys.has(k);
+addEventListener('blur', () => { keys.clear(); touchKeys.clear(); });
+
+const pourBtn = document.getElementById('pourBtn');
+let pourEmpty = null;
+if (isTouch) {
+  const dpad = document.getElementById('dpad'), knob = document.getElementById('knob');
+  // 8 секторів за кутом від центру: 0 — вправо, далі за годинниковою стрілкою
+  const DIRS = [
+    ['ArrowRight'], ['ArrowRight', 'ArrowDown'], ['ArrowDown'], ['ArrowLeft', 'ArrowDown'],
+    ['ArrowLeft'], ['ArrowLeft', 'ArrowUp'], ['ArrowUp'], ['ArrowRight', 'ArrowUp'],
+  ];
+  let padId = null;
+  const padUpdate = (e) => {
+    const r = dpad.getBoundingClientRect();
+    const dx = e.clientX - (r.left + r.width / 2), dy = e.clientY - (r.top + r.height / 2);
+    const rad = r.width / 2, len = Math.hypot(dx, dy);
+    const shift = Math.min(1, len / rad) * rad * 0.45;
+    knob.style.transform = len ? `translate(${dx / len * shift}px, ${dy / len * shift}px)` : '';
+    touchKeys.clear();
+    if (len < rad * 0.18) return;                        // мертва зона в центрі
+    const sector = (Math.round(Math.atan2(dy, dx) / (Math.PI / 4)) + 8) % 8;
+    for (const k of DIRS[sector]) touchKeys.add(k);
+  };
+  const padEnd = (e) => {
+    if (e.pointerId !== padId) return;
+    padId = null;
+    touchKeys.clear();
+    knob.style.transform = '';
+  };
+  dpad.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    padId = e.pointerId;
+    dpad.setPointerCapture(e.pointerId);
+    padUpdate(e);
+  });
+  dpad.addEventListener('pointermove', (e) => { if (e.pointerId === padId) padUpdate(e); });
+  dpad.addEventListener('pointerup', padEnd);
+  dpad.addEventListener('pointercancel', padEnd);
+  dpad.addEventListener('lostpointercapture', padEnd);
+
+  const unpress = () => pourBtn.classList.remove('pressed');
+  pourBtn.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    pourBtn.classList.add('pressed');
+    pour();
+  });
+  pourBtn.addEventListener('pointerup', unpress);
+  pourBtn.addEventListener('pointercancel', unpress);
+  pourBtn.addEventListener('pointerleave', unpress);
+  addEventListener('contextmenu', (e) => e.preventDefault());
+}
 
 function pour() {
   if (!me.full || game.phase !== 'play' || performance.now() < me.stunUntil) return;
@@ -452,9 +568,11 @@ function updateHud() {
   document.getElementById('nB').textContent = c.b;
 
   const n = peers.size + 1;
-  document.getElementById('status').innerHTML = n > 1
-    ? `Гравців у кімнаті: <b>${n}</b>${amHost() ? ' (ви хост)' : ''}`
-    : 'Ви в кімнаті самі. Надішліть посилання іншим';
+  document.getElementById('status').innerHTML = isTouch
+    ? `Гравців: <b>${n}</b>`
+    : n > 1
+      ? `Гравців у кімнаті: <b>${n}</b>${amHost() ? ' (ви хост)' : ''}`
+      : 'Ви в кімнаті самі. Надішліть посилання іншим';
 
   waitOv.classList.toggle('show', !game.round);
   const ended = game.phase === 'win' || game.phase === 'lose';
@@ -837,15 +955,25 @@ function hitByCar(cars) {
 const cv = document.getElementById('c');
 const ctx = cv.getContext('2d');
 let scale = 1, offX = 0, offY = 0;
+const hudEl = document.getElementById('hud');
+const dpadEl = document.getElementById('dpad');
 function resize() {
   const dpr = devicePixelRatio || 1;
   cv.width = innerWidth * dpr;
   cv.height = innerHeight * dpr;
-  scale = Math.min(cv.width / W, cv.height / H);
+  // На телефоні поле не ховається під HUD, а в портретній орієнтації — і під контроли
+  let top = 0, bottom = 0;
+  if (isTouch) {
+    top = hudEl.getBoundingClientRect().bottom + 6;
+    if (innerHeight > innerWidth) bottom = dpadEl.offsetHeight + 28;
+  }
+  const availH = cv.height - (top + bottom) * dpr;
+  scale = Math.min(cv.width / W, availH / H);
   offX = (cv.width - W * scale) / 2;
-  offY = (cv.height - H * scale) / 2;
+  offY = top * dpr + (availH - H * scale) / 2;
 }
 addEventListener('resize', resize);
+new ResizeObserver(resize).observe(hudEl);
 resize();
 
 let prev = performance.now();
@@ -856,10 +984,10 @@ function frame(now) {
 
   // рух
   let dx = 0, dy = 0;
-  if (keys.has('ArrowLeft')) dx -= 1;
-  if (keys.has('ArrowRight')) dx += 1;
-  if (keys.has('ArrowUp')) dy -= 1;
-  if (keys.has('ArrowDown')) dy += 1;
+  if (held('ArrowLeft')) dx -= 1;
+  if (held('ArrowRight')) dx += 1;
+  if (held('ArrowUp')) dy -= 1;
+  if (held('ArrowDown')) dy += 1;
   if (dx && dy) { dx *= Math.SQRT1_2; dy *= Math.SQRT1_2; }
   const stunned = now < me.stunUntil;
   if (stunned) { dx = 0; dy = 0; }
@@ -875,6 +1003,11 @@ function frame(now) {
     me.graceUntil = me.stunUntil + STUN_GRACE_MS;
     me.full = false;
     me.moving = false;
+  }
+
+  if (isTouch) {
+    const empty = !me.full || now < me.stunUntil;
+    if (empty !== pourEmpty) { pourEmpty = empty; pourBtn.classList.toggle('empty', empty); }
   }
 
   // локальне старіння вогню для анімації (у хоста це робить симуляція)
