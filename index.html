@@ -3,222 +3,772 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Кружечки P2P</title>
+<title>Firefighters</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Rubik:wght@400;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&family=Rubik:wght@400;600&display=swap" rel="stylesheet">
 <style>
   :root {
-    --field: #dfe6ee;
-    --dot: #c3ceda;
-    --ink: #1d2a3a;
-    --muted: #5b6b7e;
-    --panel: #ffffffe6;
+    --ink: #1f2328;
+    --muted: #59616b;
+    --panel: #fffdf8ee;
+    --line: #d9d4c7;
+    --fire: #e5532b;
     --ok: #2f8f5b;
-    --wait: #b7791f;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body {
     font-family: "Rubik", system-ui, sans-serif;
     color: var(--ink);
-    background: var(--field);
+    background: #26231f;
     overflow: hidden;
   }
   canvas { display: block; width: 100vw; height: 100vh; }
-  .panel {
-    position: fixed; top: 16px; left: 16px;
-    max-width: min(420px, calc(100vw - 32px));
-    padding: 14px 16px;
+
+  .hud {
+    position: fixed; top: 10px; left: 50%; transform: translateX(-50%);
+    width: min(440px, calc(100vw - 20px));
+    padding: 10px 12px;
     background: var(--panel);
-    border-radius: 12px;
-    box-shadow: 0 2px 12px #1d2a3a22;
-    font-size: 14px; line-height: 1.45;
+    border-radius: 10px;
+    box-shadow: 0 3px 14px #0006;
+    font-size: 13px; line-height: 1.4;
   }
-  .panel h1 { margin: 0 0 8px; font-size: 18px; font-weight: 600; }
-  .row { display: flex; gap: 8px; align-items: center; }
+  .title {
+    margin: 0 0 8px; font-family: "Press Start 2P", monospace; font-size: 13px;
+    color: var(--fire); letter-spacing: 1px;
+  }
+  .row { display: flex; gap: 6px; align-items: center; }
   .link {
     flex: 1; min-width: 0;
-    padding: 6px 8px; border: 1px solid var(--dot); border-radius: 8px;
+    padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px;
     font: inherit; color: var(--muted); background: #fff;
   }
   button {
     font: inherit; font-weight: 600;
-    padding: 6px 12px; border: 0; border-radius: 8px;
+    padding: 5px 12px; border: 0; border-radius: 6px;
     background: var(--ink); color: #fff; cursor: pointer;
   }
   button:focus-visible, .link:focus-visible { outline: 2px solid #3b82f6; outline-offset: 2px; }
-  .status { margin-top: 8px; color: var(--muted); }
+  .status { margin-top: 6px; color: var(--muted); }
   .status b { color: var(--ink); }
-  .dotst { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--wait); }
-  .dotst.ok { background: var(--ok); }
-  .hint { margin-top: 4px; color: var(--muted); }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px; }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .sw { width: 11px; height: 11px; border-radius: 2px; display: inline-block; }
+  .hint { margin-top: 6px; color: var(--muted); font-size: 12px; }
+
+  .overlay {
+    position: fixed; inset: 0; display: none;
+    align-items: center; justify-content: center;
+    background: #0005;
+  }
+  .overlay.show { display: flex; }
+  .card {
+    background: var(--panel); border-radius: 12px; padding: 22px 26px;
+    text-align: center; box-shadow: 0 6px 24px #0008; max-width: calc(100vw - 32px);
+  }
+  .card h2 { margin: 0 0 12px; font-family: "Press Start 2P", monospace; font-size: 16px; line-height: 1.5; }
+  .card p { margin: 0 0 16px; color: var(--muted); }
+  .win h2 { color: var(--ok); }
+  .lose h2 { color: var(--fire); }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
 
-<div class="panel">
-  <h1>Кружечки</h1>
+<div class="hud">
+  <h1 class="title">FIREFIGHTERS</h1>
   <div class="row">
     <input class="link" id="link" readonly aria-label="Посилання на гру">
     <button id="copy">Копіювати</button>
   </div>
-  <div class="status"><span class="dotst" id="dot"></span><span id="status">Підключення до кімнати…</span></div>
-  <div class="hint">Рух — стрілки на клавіатурі</div>
+  <div class="status" id="status">Підключення до кімнати…</div>
+  <div class="legend">
+    <span><i class="sw" style="background:#4e8a38"></i>Ціла: <b id="nG">0</b></span>
+    <span><i class="sw" style="background:#f07a22"></i>Горить: <b id="nF">0</b></span>
+    <span><i class="sw" style="background:#8b8b86"></i>Погашена: <b id="nX">0</b></span>
+    <span><i class="sw" style="background:#22201d"></i>Згоріла: <b id="nB">0</b></span>
+  </div>
+  <div class="hint">Стрілки — рух. Біля річки відро наповнюється само. Пробіл — вилити воду на палаючу ділянку, на якій стоїш.</div>
+</div>
+
+<div class="overlay" id="waitOv">
+  <div class="card"><h2>Пошук гравців</h2><p>Підключаємось до кімнати…</p></div>
+</div>
+
+<div class="overlay" id="endOv">
+  <div class="card" id="endCard">
+    <h2 id="endTitle"></h2>
+    <p id="endText"></p>
+    <button id="restart">Нова гра</button>
+  </div>
 </div>
 
 <script type="module">
 import { joinRoom, selfId } from 'https://esm.run/trystero@0.25.4';
 
-// ---------- Кімната з URL ----------
+// ================= Налаштування =================
+const CELL = 60;                 // розмір ділянки посадки (одиниці світу)
+const COLS = 5, ROWS = 10;       // посадка 5 × 10 ділянок
+const W = CELL * 15;             // 900: річка 1/6, обочина 1/6, дорога 1/3, посадка 1/3
+const H = CELL * ROWS;           // 600
+const RIVER_W = W / 6;
+const SHOULDER_X = RIVER_W, SHOULDER_W = W / 6;
+const ROAD_X = SHOULDER_X + SHOULDER_W, ROAD_W = W / 3;
+const FOREST_X = ROAD_X + ROAD_W;
+const N = COLS * ROWS;
+
+const SPEED = 300;               // швидкість гравця, одиниць/сек
+const BURN_TIME = 40;            // за скільки секунд палаюча ділянка вигорає сама
+const SPREAD_RATE = 0.04;        // шанс/сек підпалити кожну сусідню (8 напрямків) цілу ділянку
+const START_FIRES = 3;           // скільки ділянок горить на старті
+const TICK = 0.25;               // крок симуляції вогню у хоста, сек
+const GRACE_MS = 3000;           // очікування інших гравців перед стартом власної гри
+const FILL_X = RIVER_W + 22;     // лівіше цієї межі відро наповнюється
+
+// ================= Кімната з URL =================
 let roomId = location.hash.slice(1);
 if (!roomId) {
   roomId = Math.random().toString(36).slice(2, 10);
   history.replaceState(null, '', '#' + roomId);
 }
 const linkEl = document.getElementById('link');
+const copyBtn = document.getElementById('copy');
 linkEl.value = location.href;
-document.getElementById('copy').onclick = async () => {
+copyBtn.onclick = async () => {
   try { await navigator.clipboard.writeText(location.href); }
   catch { linkEl.select(); document.execCommand('copy'); }
-  document.getElementById('copy').textContent = 'Скопійовано';
-  setTimeout(() => document.getElementById('copy').textContent = 'Копіювати', 1500);
+  copyBtn.textContent = 'Скопійовано';
+  copyBtn.blur();
+  setTimeout(() => copyBtn.textContent = 'Копіювати', 1500);
 };
 
-// ---------- Світ ----------
-const WORLD_W = 1000, WORLD_H = 700, R = 22, SPEED = 320; // px/сек у координатах світу
-
-const me = {
-  x: R + Math.random() * (WORLD_W - 2 * R),
-  y: R + Math.random() * (WORLD_H - 2 * R),
-  c: `hsl(${Math.floor(Math.random() * 360)} 70% 55%)`,
-};
-
-// peerId -> { x, y, tx, ty, c }
-const peers = new Map();
-
-// ---------- P2P ----------
-const room = joinRoom({ appId: 'yurii-circles-demo-v1' }, roomId);
-const state = room.makeAction('state');
-
-function updateStatus() {
-  const n = peers.size;
-  document.getElementById('status').innerHTML =
-    n ? `Гравців у кімнаті: <b>${n + 1}</b>` : 'Ви в кімнаті. Надішліть посилання іншим';
-  document.getElementById('dot').classList.toggle('ok', n > 0);
+// ================= Утиліти =================
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
 }
-updateStatus();
+function makeCanvas(w, h) { const c = document.createElement('canvas'); c.width = w; c.height = h; return c; }
+const safe = (p) => { if (p && p.catch) p.catch(() => {}); };
 
-room.onPeerJoin = (peerId) => {
-  // Новому гравцю одразу відправляємо свій стан
-  state.send(me, { target: peerId });
+// сусіди ділянки (8 напрямків)
+const NEIGH = [];
+for (let i = 0; i < N; i++) {
+  const x = i % COLS, y = Math.floor(i / COLS), list = [];
+  for (let dx = -1; dx <= 1; dx++) for (let dy = -1; dy <= 1; dy++) {
+    if (!dx && !dy) continue;
+    const nx = x + dx, ny = y + dy;
+    if (nx >= 0 && nx < COLS && ny >= 0 && ny < ROWS) list.push(ny * COLS + nx);
+  }
+  NEIGH.push(list);
+}
+function cellAt(x, y) {
+  if (x < FOREST_X || x >= W || y < 0 || y >= H) return -1;
+  return Math.floor(y / CELL) * COLS + Math.floor((x - FOREST_X) / CELL);
+}
+
+// ================= Стан =================
+const joinedAt = Date.now();
+const me = {
+  x: SHOULDER_X + 40 + Math.random() * (SHOULDER_W + ROAD_W - 80),
+  y: 240 + Math.random() * (H - 280),
+  hue: Math.floor(Math.random() * 360),
+  face: 1, full: false, moving: false,
+};
+// peerId -> { t, x, y, tx, ty, hue, face, full, moving, hasPos }
+const peers = new Map();
+// grid: 'g' ціла, 'f' горить, 'x' погашена, 'b' згоріла
+let game = { round: 0, grid: Array(N).fill('g'), ages: Array(N).fill(0), phase: 'wait' };
+let ready = false;
+const pending = new Map();                 // локально погашені ділянки, які ще не підтвердив хост
+const steamAt = new Float64Array(N);       // час, коли ділянку погасили (для пари)
+
+function getPeer(id) {
+  let p = peers.get(id);
+  if (!p) {
+    p = { t: null, x: W / 2, y: H / 2, tx: W / 2, ty: H / 2, hue: 0, face: 1, full: false, moving: false, hasPos: false };
+    peers.set(id, p);
+  }
+  return p;
+}
+
+// Хост — учасник, що зайшов найраніше (серед тих, про кого відомо)
+function hostId() {
+  let bestId = selfId, bestT = joinedAt;
+  for (const [id, p] of peers) {
+    if (p.t == null) continue;
+    if (p.t < bestT || (p.t === bestT && id < bestId)) { bestId = id; bestT = p.t; }
+  }
+  return bestId;
+}
+const amHost = () => hostId() === selfId;
+
+// ================= P2P =================
+const room = joinRoom({ appId: 'yurii-firefighters-v1' }, roomId);
+const helloA = room.makeAction('hello');
+const posA = room.makeAction('pos');
+const worldA = room.makeAction('world');
+const douseA = room.makeAction('douse');
+const restartA = room.makeAction('restart');
+
+const myPos = () => ({
+  x: Math.round(me.x), y: Math.round(me.y), h: me.hue,
+  f: me.face, b: me.full ? 1 : 0, m: me.moving ? 1 : 0,
+});
+const worldMsg = () => ({
+  r: game.round, g: game.grid.join(''),
+  a: game.ages.map(v => Math.round(v * 10) / 10), p: game.phase,
+});
+function sendWorld(target) {
+  if (!game.round) return;
+  safe(worldA.send(worldMsg(), target ? { target } : undefined));
+}
+
+room.onPeerJoin = (id) => {
+  getPeer(id);
+  safe(helloA.send({ t: joinedAt }, { target: id }));
+  safe(posA.send(myPos(), { target: id }));
+  if (amHost()) sendWorld(id);
+  updateHud();
+};
+room.onPeerLeave = (id) => {
+  peers.delete(id);
+  updateHud();
 };
 
-room.onPeerLeave = (peerId) => {
-  peers.delete(peerId);
-  updateStatus();
+helloA.onMessage = (d, { peerId }) => {
+  getPeer(peerId).t = d.t;
+  updateHud();
 };
 
-state.onMessage = (data, { peerId }) => {
-  const p = peers.get(peerId);
-  if (p) {
-    p.tx = data.x; p.ty = data.y; p.c = data.c;
+posA.onMessage = (d, { peerId }) => {
+  const p = getPeer(peerId);
+  if (!p.hasPos) { p.x = d.x; p.y = d.y; p.hasPos = true; }
+  p.tx = d.x; p.ty = d.y; p.hue = d.h; p.face = d.f; p.full = !!d.b; p.moving = !!d.m;
+};
+
+worldA.onMessage = (d, { peerId }) => {
+  if (peerId !== hostId() && game.round) return;   // стан приймаємо тільки від хоста
+  ready = true;
+  const grid = d.g.split('');
+  if (d.r === game.round) {
+    const now = performance.now();
+    for (const [i, t0] of pending) {
+      if (now - t0 > 1500) pending.delete(i);
+      else if (grid[i] === 'f') grid[i] = 'x';
+    }
   } else {
-    peers.set(peerId, { x: data.x, y: data.y, tx: data.x, ty: data.y, c: data.c });
-    updateStatus();
+    pending.clear();
+  }
+  applyGrid(grid);
+  game.round = d.r;
+  game.ages = d.a.slice();
+  game.phase = d.p;
+  updateHud();
+};
+
+douseA.onMessage = (d, { peerId }) => {
+  if (!amHost() || d.r !== game.round || game.phase !== 'play') return;
+  if (game.grid[d.i] === 'f') {
+    game.grid[d.i] = 'x';
+    steamAt[d.i] = performance.now();
+    checkEnd();
+    sendWorld();
+    updateHud();
   }
 };
 
-// Розсилка власного стану ~20 разів/сек, тільки коли змінився
-let lastSent = '';
+restartA.onMessage = (d) => {
+  if (amHost() && d.r === game.round && game.phase !== 'play') newRound();
+};
+
+function applyGrid(grid) {
+  const now = performance.now();
+  for (let i = 0; i < N; i++) {
+    if (game.grid[i] === 'f' && grid[i] === 'x') steamAt[i] = now;
+  }
+  game.grid = grid;
+}
+
+// ================= Логіка вогню (тільки хост) =================
+function newRound() {
+  const g = Array(N).fill('g'), a = Array(N).fill(0);
+  const sy = 2 + Math.floor(Math.random() * (ROWS - 4));
+  const sx = Math.floor(Math.random() * COLS);
+  g[sy * COLS + sx] = 'f';
+  let lit = 1, guard = 0;
+  while (lit < START_FIRES && guard++ < 200) {
+    const burning = [];
+    for (let i = 0; i < N; i++) if (g[i] === 'f') burning.push(i);
+    const b = burning[Math.floor(Math.random() * burning.length)];
+    const n = NEIGH[b][Math.floor(Math.random() * NEIGH[b].length)];
+    if (g[n] === 'g') { g[n] = 'f'; a[n] = Math.random() * 3; lit++; }
+  }
+  game = { round: Math.max(Date.now(), game.round + 1), grid: g, ages: a, phase: 'play' };
+  pending.clear();
+  steamAt.fill(0);
+  sendWorld();
+  updateHud();
+}
+
+function checkEnd() {
+  if (game.phase !== 'play') return;
+  if (game.grid.includes('f')) return;
+  game.phase = game.grid.includes('g') ? 'win' : 'lose';
+}
+
+function hostTick(dt) {
+  const g = game.grid, a = game.ages, ignite = [];
+  let changed = false;
+  for (let i = 0; i < N; i++) {
+    if (g[i] !== 'f') continue;
+    a[i] += dt;
+    for (const n of NEIGH[i]) {
+      if (g[n] === 'g' && Math.random() < SPREAD_RATE * dt) ignite.push(n);
+    }
+  }
+  for (let i = 0; i < N; i++) {
+    if (g[i] === 'f' && a[i] >= BURN_TIME) { g[i] = 'b'; changed = true; }
+  }
+  for (const n of ignite) {
+    if (g[n] === 'g') { g[n] = 'f'; a[n] = 0; changed = true; }
+  }
+  checkEnd();
+  return changed || game.phase !== 'play';
+}
+
+let tickCount = 0;
 setInterval(() => {
-  const s = `${Math.round(me.x)},${Math.round(me.y)}`;
-  if (s !== lastSent && peers.size) {
-    lastSent = s;
-    state.send({ x: Math.round(me.x), y: Math.round(me.y), c: me.c });
+  tickCount++;
+  if (!amHost()) return;
+  if (!game.round) {
+    if (ready) newRound();
+    return;
+  }
+  let changed = false;
+  if (game.phase === 'play') changed = hostTick(TICK);
+  if (changed || tickCount % 4 === 0) sendWorld();   // зміни — одразу, інакше раз на секунду
+  if (changed) updateHud();
+}, TICK * 1000);
+
+setTimeout(() => { ready = true; updateHud(); }, GRACE_MS);
+
+// Розсилка власної позиції
+let lastPos = '', lastPosT = 0;
+setInterval(() => {
+  if (!peers.size) return;
+  const p = myPos(), s = JSON.stringify(p), now = performance.now();
+  if (s !== lastPos || now - lastPosT > 1000) {
+    lastPos = s; lastPosT = now;
+    safe(posA.send(p));
   }
 }, 50);
 
-// ---------- Ввід ----------
+// ================= Ввід =================
 const keys = new Set();
 const ARROWS = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
 addEventListener('keydown', (e) => {
   if (ARROWS.includes(e.key)) { keys.add(e.key); e.preventDefault(); }
+  if (e.code === 'Space') { e.preventDefault(); if (!e.repeat) pour(); }
 });
 addEventListener('keyup', (e) => keys.delete(e.key));
 addEventListener('blur', () => keys.clear());
 
-// ---------- Рендер ----------
+function pour() {
+  if (!me.full || game.phase !== 'play') return;
+  const i = cellAt(me.x, me.y - 4);
+  if (i < 0 || game.grid[i] !== 'f') return;
+  me.full = false;
+  game.grid[i] = 'x';
+  steamAt[i] = performance.now();
+  if (amHost()) {
+    checkEnd();
+    sendWorld();
+  } else {
+    pending.set(i, performance.now());
+    safe(douseA.send({ r: game.round, i }, { target: hostId() }));
+  }
+  updateHud();
+}
+
+document.getElementById('restart').onclick = (e) => {
+  e.currentTarget.blur();
+  if (amHost()) newRound();
+  else safe(restartA.send({ r: game.round }, { target: hostId() }));
+};
+
+// ================= HUD =================
+const waitOv = document.getElementById('waitOv');
+const endOv = document.getElementById('endOv');
+function updateHud() {
+  const c = { g: 0, f: 0, x: 0, b: 0 };
+  for (const s of game.grid) c[s]++;
+  document.getElementById('nG').textContent = c.g;
+  document.getElementById('nF').textContent = c.f;
+  document.getElementById('nX').textContent = c.x;
+  document.getElementById('nB').textContent = c.b;
+
+  const n = peers.size + 1;
+  document.getElementById('status').innerHTML = n > 1
+    ? `Гравців у кімнаті: <b>${n}</b>${amHost() ? ' (ви хост)' : ''}`
+    : 'Ви в кімнаті самі. Надішліть посилання іншим';
+
+  waitOv.classList.toggle('show', !game.round);
+  const ended = game.phase === 'win' || game.phase === 'lose';
+  endOv.classList.toggle('show', ended);
+  if (ended) {
+    const card = document.getElementById('endCard');
+    card.className = 'card ' + game.phase;
+    document.getElementById('endTitle').textContent =
+      game.phase === 'win' ? 'Пожежу загашено!' : 'Посадка згоріла';
+    document.getElementById('endText').textContent =
+      `Вціліло ділянок: ${c.g} з ${N}. Погашено: ${c.x}. Згоріло: ${c.b}.`;
+  }
+}
+updateHud();
+
+// ================= Графіка: статичний фон =================
+const BG = 2; // роздільна здатність пререндеру
+function buildBackground() {
+  const c = makeCanvas(W * BG, H * BG), g = c.getContext('2d');
+  g.scale(BG, BG);
+  const rnd = mulberry32(7);
+
+  // обочина: ґрунт із гравієм
+  g.fillStyle = '#9a8a6c';
+  g.fillRect(SHOULDER_X, 0, SHOULDER_W, H);
+  for (let i = 0; i < 6000; i++) {
+    const x = SHOULDER_X + rnd() * SHOULDER_W, y = rnd() * H, s = 0.6 + rnd() * 1.8;
+    g.fillStyle = rnd() < 0.5 ? `rgba(70,58,40,${0.2 + rnd() * 0.3})` : `rgba(215,205,180,${0.2 + rnd() * 0.35})`;
+    g.fillRect(x, y, s, s);
+  }
+  // берег
+  g.fillStyle = '#6f6149';
+  g.fillRect(SHOULDER_X, 0, 5, H);
+
+  // асфальт
+  g.fillStyle = '#343434';
+  g.fillRect(ROAD_X, 0, ROAD_W, H);
+  for (let i = 0; i < 16000; i++) {
+    const x = ROAD_X + rnd() * ROAD_W, y = rnd() * H, s = 0.5 + rnd() * 1.4;
+    const l = rnd() < 0.6 ? 18 + rnd() * 30 : 110 + rnd() * 120;
+    g.fillStyle = `rgba(${l},${l},${l},${0.35 + rnd() * 0.5})`;
+    g.fillRect(x, y, s, s);
+  }
+  // пунктирна розмітка
+  const DASH = 70, GAP = 45, LW = 14, cx = ROAD_X + ROAD_W / 2, OFF = 20;
+  g.fillStyle = '#eeeeee';
+  for (let y = -OFF; y < H; y += DASH + GAP) g.fillRect(cx - LW / 2, y, LW, DASH);
+  for (let i = 0; i < 900; i++) {
+    const x = cx - LW / 2 + rnd() * LW, y = rnd() * H;
+    if (((y + OFF) % (DASH + GAP)) >= DASH) continue;
+    const l = 150 + rnd() * 80;
+    g.fillStyle = `rgba(${l},${l},${l},0.7)`;
+    g.fillRect(x, y, 0.6 + rnd(), 0.6 + rnd());
+  }
+  // тінь краю дороги
+  g.fillStyle = 'rgba(0,0,0,0.18)';
+  g.fillRect(ROAD_X, 0, 3, H);
+  g.fillRect(ROAD_X + ROAD_W - 3, 0, 3, H);
+  return c;
+}
+const bgCanvas = buildBackground();
+
+// ================= Графіка: ділянки посадки =================
+const TILE_PAL = {
+  g: { ground: '#4e8a38', lite: '#63a34a', dark: '#3b6e2b', tree: '#2e6428', treeLite: '#43903a' },
+  f: { ground: '#5b4a2c', lite: '#6e5a34', dark: '#43361f', tree: '#3a3219', treeLite: '#4d4222' },
+  x: { ground: '#8b8b86', lite: '#a09f9a', dark: '#74746e', tree: '#66665f', treeLite: '#7d7d76' },
+  b: { ground: '#22201d', lite: '#302d29', dark: '#141210', tree: '#0d0c0b', treeLite: '#1b1917' },
+};
+function buildTile(idx, state) {
+  const c = makeCanvas(CELL * BG, CELL * BG), g = c.getContext('2d');
+  g.scale(BG, BG);
+  const p = TILE_PAL[state];
+  g.fillStyle = p.ground;
+  g.fillRect(0, 0, CELL, CELL);
+  const r1 = mulberry32(idx * 31 + 1);
+  for (let i = 0; i < 160; i++) {
+    const x = r1() * CELL, y = r1() * CELL;
+    g.fillStyle = r1() < 0.5 ? p.lite : p.dark;
+    g.fillRect(x, y, 1.2, 2.2);
+  }
+  const r2 = mulberry32(idx * 97 + 5);
+  const n = 2 + Math.floor(r2() * 2);
+  for (let k = 0; k < n; k++) {
+    const tx = 13 + r2() * 34, ty = 13 + r2() * 34, r = 9 + r2() * 6;
+    if (state === 'b') {
+      g.fillStyle = p.tree;
+      g.beginPath(); g.arc(tx, ty, r * 0.35, 0, Math.PI * 2); g.fill();
+      g.strokeStyle = p.lite; g.lineWidth = 1.5;
+      g.beginPath(); g.moveTo(tx - r * 0.8, ty + r * 0.2); g.lineTo(tx + r * 0.6, ty - r * 0.3); g.stroke();
+      continue;
+    }
+    g.fillStyle = 'rgba(0,0,0,0.25)';
+    g.beginPath(); g.arc(tx + 3, ty + 4, r, 0, Math.PI * 2); g.fill();
+    g.fillStyle = p.tree;
+    for (const [ox, oy, s] of [[0, 0, 1], [-r * 0.45, r * 0.25, 0.7], [r * 0.45, r * 0.2, 0.7]]) {
+      g.beginPath(); g.arc(tx + ox, ty + oy, r * s, 0, Math.PI * 2); g.fill();
+    }
+    g.fillStyle = p.treeLite;
+    g.beginPath(); g.arc(tx - r * 0.3, ty - r * 0.3, r * 0.45, 0, Math.PI * 2); g.fill();
+  }
+  g.strokeStyle = 'rgba(0,0,0,0.14)';
+  g.lineWidth = 1;
+  g.strokeRect(0.5, 0.5, CELL - 1, CELL - 1);
+  return c;
+}
+const tiles = [];
+for (let i = 0; i < N; i++) tiles.push({ g: buildTile(i, 'g'), f: buildTile(i, 'f'), x: buildTile(i, 'x'), b: buildTile(i, 'b') });
+
+// Параметри язиків полум'я для кожної ділянки (однакові в усіх гравців)
+const flames = [];
+for (let i = 0; i < N; i++) {
+  const r = mulberry32(i * 13 + 3), list = [];
+  for (let k = 0; k < 6; k++) list.push({ x: 10 + r() * 40, y: 16 + r() * 40, ph: r() * 10, s: r() });
+  list.sort((a, b) => a.y - b.y);
+  flames.push(list);
+}
+
+// ================= Графіка: річка =================
+const ripples = [];
+{
+  const r = mulberry32(42);
+  for (let i = 0; i < 46; i++) {
+    ripples.push({ x: 8 + r() * (RIVER_W - 20), y: r() * H, len: 10 + r() * 22, sp: 45 + r() * 35, ph: r() * 6 });
+  }
+}
+function drawRiver(t) {
+  const gr = ctx.createLinearGradient(0, 0, RIVER_W, 0);
+  gr.addColorStop(0, '#1f5f9e');
+  gr.addColorStop(0.5, '#2f7fc4');
+  gr.addColorStop(1, '#2a70b0');
+  ctx.fillStyle = gr;
+  ctx.fillRect(0, 0, RIVER_W, H);
+  ctx.lineCap = 'round';
+  for (const rp of ripples) {
+    const y = ((rp.y + t * rp.sp) % (H + 60)) - 30;
+    const x = rp.x + Math.sin(t * 1.5 + rp.ph) * 3;
+    ctx.strokeStyle = 'rgba(170,215,245,0.55)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.quadraticCurveTo(x + 4, y + rp.len / 2, x, y + rp.len);
+    ctx.stroke();
+  }
+  // мокрий край біля берега
+  ctx.fillStyle = 'rgba(255,255,255,0.12)';
+  ctx.fillRect(RIVER_W - 4, 0, 4, H);
+}
+
+// ================= Графіка: вогонь і пара =================
+function flameShape(x, y, w, h, sway, color) {
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(x - w / 2, y);
+  ctx.quadraticCurveTo(x - w / 2, y - h * 0.55, x + sway, y - h);
+  ctx.quadraticCurveTo(x + w / 2, y - h * 0.55, x + w / 2, y);
+  ctx.quadraticCurveTo(x, y + w * 0.35, x - w / 2, y);
+  ctx.fill();
+}
+function drawFire(i, age, t) {
+  const cx = FOREST_X + (i % COLS) * CELL, cy = Math.floor(i / COLS) * CELL;
+  let k = Math.min(1, 0.45 + age / 4);
+  const left = BURN_TIME - age;
+  if (left < 5) k = Math.min(k, Math.max(0.3, left / 5));
+
+  const gr = ctx.createRadialGradient(cx + 30, cy + 32, 4, cx + 30, cy + 32, 48);
+  gr.addColorStop(0, `rgba(255,150,40,${0.5 * k})`);
+  gr.addColorStop(1, 'rgba(255,80,20,0)');
+  ctx.fillStyle = gr;
+  ctx.fillRect(cx - 18, cy - 18, CELL + 36, CELL + 36);
+
+  for (const f of flames[i]) {
+    const flick = 0.75 + 0.2 * Math.sin(t * 9 + f.ph) + 0.08 * Math.sin(t * 23 + f.ph * 2);
+    const h = (22 + 16 * f.s) * k * flick, w = h * 0.6;
+    const sw = Math.sin(t * 5 + f.ph) * 2.5;
+    const x = cx + f.x, y = cy + f.y;
+    flameShape(x, y, w, h, sw, '#d8341c');
+    flameShape(x, y, w * 0.68, h * 0.72, sw * 0.8, '#ff8a1f');
+    flameShape(x, y, w * 0.38, h * 0.45, sw * 0.5, '#ffe066');
+    // іскри
+    const p = (t * 0.9 + f.ph) % 1;
+    ctx.fillStyle = `rgba(255,220,120,${(1 - p) * k})`;
+    ctx.fillRect(x + Math.sin(t * 3 + f.ph) * 5, y - h - p * 22, 2, 2);
+  }
+}
+function drawSteam(i, now) {
+  const age = (now - steamAt[i]) / 1000;
+  if (age > 1.8) return;
+  const cx = FOREST_X + (i % COLS) * CELL + 30, cy = Math.floor(i / COLS) * CELL + 34;
+  for (let k = 0; k < 5; k++) {
+    const p = Math.min(1, age / 1.8 + k * 0.04);
+    ctx.fillStyle = `rgba(240,240,240,${0.55 * (1 - p)})`;
+    ctx.beginPath();
+    ctx.arc(cx - 16 + k * 8 + Math.sin(age * 4 + k) * 4, cy - p * 38 - (k % 2) * 6, 7 + p * 9, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// ================= Графіка: пожежник (піксельний спрайт, вид збоку) =================
+const PX = 3; // розмір "пікселя" спрайта в одиницях світу
+const BODY = [
+  '.....hHHHh......',
+  '....hHHHHHh.....',
+  '....HHHHHHHH....',
+  '..hhhhhhhhhhh...',
+  '.....SSSSSS.....',
+  '.....SSSSES.....',
+  '.....SSSSSSS....',
+  '......SSSS......',
+  '....JJJJJJJ.....',
+  '...JJJJJJJJJ....',
+  '...JYYYYYYYJ....',
+  '...JJJJJJJJJJ...',
+  '...JJJJJJJJJGG..',
+  '...YYYYYYYYY....',
+];
+const LEGS = [
+  ['....PPP.PPP.....',
+   '....PPP.PPP.....',
+   '....PPP.PPP.....',
+   '...BBBB.BBBB....'],
+  ['....PPP..PPP....',
+   '...PPP....PPP...',
+   '..PPP......PPP..',
+   '.BBBB......BBBB.'],
+];
+const BUCKET = ['..k..', '.k.k.', 'WwWWW', 'MMMMM', '.MMM.', '.MMM.'];
+const SPR_W = 16, SPR_H = 18;
+const spriteCache = new Map();
+function sprite(hue, frame, full) {
+  const key = `${hue}|${frame}|${full}`;
+  let c = spriteCache.get(key);
+  if (c) return c;
+  const pal = {
+    H: `hsl(${hue} 75% 50%)`, h: `hsl(${hue} 75% 34%)`,
+    S: '#f2c28b', E: '#1b1b1b', J: '#c2913f', Y: '#f4e04d',
+    P: '#8c6a2f', B: '#2b2b2b', G: '#3a3a3a', M: '#9aa3ad', k: '#5f6770',
+    W: full ? '#3aa6f0' : '#2a2f36', w: full ? '#a8dcff' : '#2a2f36',
+  };
+  c = makeCanvas(SPR_W * PX, SPR_H * PX);
+  const g = c.getContext('2d');
+  const put = (col, row, ch) => { if (pal[ch]) { g.fillStyle = pal[ch]; g.fillRect(col * PX, row * PX, PX, PX); } };
+  const rows = BODY.concat(LEGS[frame]);
+  rows.forEach((r, y) => [...r].forEach((ch, x) => { if (ch !== 'G') put(x, y, ch); }));
+  BUCKET.forEach((r, y) => [...r].forEach((ch, x) => { if (ch !== '.') put(11 + x, 12 + y, ch); }));
+  rows.forEach((r, y) => [...r].forEach((ch, x) => { if (ch === 'G') put(x, y, ch); }));
+  spriteCache.set(key, c);
+  return c;
+}
+function drawPlayer(x, y, hue, face, full, moving, mine, t) {
+  const frame = moving && Math.floor(t * 7) % 2 ? 1 : 0;
+  ctx.fillStyle = 'rgba(0,0,0,0.28)';
+  ctx.beginPath(); ctx.ellipse(x, y, 17, 5, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.save();
+  ctx.translate(Math.round(x), Math.round(y));
+  ctx.scale(face, 1);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(sprite(hue, frame, full), -SPR_W * PX / 2, -SPR_H * PX);
+  ctx.restore();
+  if (mine) {
+    const ty = y - SPR_H * PX - 8;
+    ctx.fillStyle = '#ffffff';
+    ctx.strokeStyle = '#1f2328';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(x - 7, ty - 8); ctx.lineTo(x + 7, ty - 8); ctx.lineTo(x, ty); ctx.closePath();
+    ctx.fill(); ctx.stroke();
+  }
+}
+
+// ================= Рендер і ігровий цикл =================
 const cv = document.getElementById('c');
 const ctx = cv.getContext('2d');
 let scale = 1, offX = 0, offY = 0;
-
 function resize() {
   const dpr = devicePixelRatio || 1;
   cv.width = innerWidth * dpr;
   cv.height = innerHeight * dpr;
-  scale = Math.min(cv.width / WORLD_W, cv.height / WORLD_H);
-  offX = (cv.width - WORLD_W * scale) / 2;
-  offY = (cv.height - WORLD_H * scale) / 2;
+  scale = Math.min(cv.width / W, cv.height / H);
+  offX = (cv.width - W * scale) / 2;
+  offY = (cv.height - H * scale) / 2;
 }
 addEventListener('resize', resize);
 resize();
-
-function drawCircle(x, y, color, mine) {
-  ctx.beginPath();
-  ctx.arc(x, y, R, 0, Math.PI * 2);
-  ctx.fillStyle = color;
-  ctx.fill();
-  if (mine) {
-    ctx.lineWidth = 4;
-    ctx.strokeStyle = '#1d2a3a';
-    ctx.stroke();
-  }
-}
 
 let prev = performance.now();
 function frame(now) {
   const dt = Math.min((now - prev) / 1000, 0.1);
   prev = now;
+  const t = now / 1000;
 
-  // Рух власного кружечка
+  // рух
   let dx = 0, dy = 0;
   if (keys.has('ArrowLeft')) dx -= 1;
   if (keys.has('ArrowRight')) dx += 1;
   if (keys.has('ArrowUp')) dy -= 1;
   if (keys.has('ArrowDown')) dy += 1;
   if (dx && dy) { dx *= Math.SQRT1_2; dy *= Math.SQRT1_2; }
-  me.x = Math.max(R, Math.min(WORLD_W - R, me.x + dx * SPEED * dt));
-  me.y = Math.max(R, Math.min(WORLD_H - R, me.y + dy * SPEED * dt));
+  me.moving = !!(dx || dy);
+  if (dx) me.face = dx > 0 ? 1 : -1;
+  me.x = Math.max(RIVER_W + 10, Math.min(W - 16, me.x + dx * SPEED * dt));
+  me.y = Math.max(40, Math.min(H - 4, me.y + dy * SPEED * dt));
+  if (me.x <= FILL_X) me.full = true;
 
-  // Згладжування позицій інших гравців
-  const k = 1 - Math.pow(0.001, dt);
-  for (const p of peers.values()) {
-    p.x += (p.tx - p.x) * k;
-    p.y += (p.ty - p.y) * k;
+  // локальне старіння вогню для анімації (у хоста це робить симуляція)
+  if (!amHost() && game.phase === 'play') {
+    for (let i = 0; i < N; i++) if (game.grid[i] === 'f') game.ages[i] += dt;
   }
 
-  // Поле
+  // згладжування чужих позицій
+  const k = 1 - Math.pow(0.001, dt);
+  for (const p of peers.values()) { p.x += (p.tx - p.x) * k; p.y += (p.ty - p.y) * k; }
+
+  // --- малювання ---
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.fillStyle = '#cfd8e3';
+  ctx.fillStyle = '#26231f';
   ctx.fillRect(0, 0, cv.width, cv.height);
   ctx.setTransform(scale, 0, 0, scale, offX, offY);
-  ctx.fillStyle = '#dfe6ee';
-  ctx.fillRect(0, 0, WORLD_W, WORLD_H);
-  ctx.fillStyle = '#c3ceda';
-  for (let x = 25; x < WORLD_W; x += 50)
-    for (let y = 25; y < WORLD_H; y += 50)
-      ctx.fillRect(x - 1.5, y - 1.5, 3, 3);
+  ctx.save();
+  ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.clip();
 
-  for (const p of peers.values()) drawCircle(p.x, p.y, p.c, false);
-  drawCircle(me.x, me.y, me.c, true);
+  ctx.imageSmoothingEnabled = true;
+  drawRiver(t);
+  ctx.drawImage(bgCanvas, 0, 0, W, H);
+  for (let i = 0; i < N; i++) {
+    ctx.drawImage(tiles[i][game.grid[i]], FOREST_X + (i % COLS) * CELL, Math.floor(i / COLS) * CELL, CELL, CELL);
+  }
 
+  // підсвітка ділянки, яку можна загасити
+  const ci = cellAt(me.x, me.y - 4);
+  if (me.full && ci >= 0 && game.grid[ci] === 'f' && game.phase === 'play') {
+    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+    ctx.lineWidth = 3;
+    ctx.setLineDash([8, 6]);
+    ctx.strokeRect(FOREST_X + (ci % COLS) * CELL + 2, Math.floor(ci / COLS) * CELL + 2, CELL - 4, CELL - 4);
+    ctx.setLineDash([]);
+  }
+
+  for (let i = 0; i < N; i++) if (game.grid[i] === 'f') drawFire(i, game.ages[i], t);
+  for (let i = 0; i < N; i++) if (steamAt[i]) drawSteam(i, now);
+
+  // гравці, відсортовані по y
+  const list = [];
+  for (const p of peers.values()) if (p.hasPos) list.push({ x: p.x, y: p.y, hue: p.hue, face: p.face, full: p.full, moving: p.moving, mine: false });
+  list.push({ x: me.x, y: me.y, hue: me.hue, face: me.face, full: me.full, moving: me.moving, mine: true });
+  list.sort((a, b) => a.y - b.y);
+  for (const p of list) drawPlayer(p.x, p.y, p.hue, p.face, p.full, p.moving, p.mine, t);
+
+  ctx.restore();
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
 
 addEventListener('beforeunload', () => room.leave());
-console.log('selfId:', selfId, 'room:', roomId);
 </script>
 </body>
 </html>
