@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Кружечки P2P</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Rubik:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --field: #dfe6ee;
+    --dot: #c3ceda;
+    --ink: #1d2a3a;
+    --muted: #5b6b7e;
+    --panel: #ffffffe6;
+    --ok: #2f8f5b;
+    --wait: #b7791f;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: "Rubik", system-ui, sans-serif;
+    color: var(--ink);
+    background: var(--field);
+    overflow: hidden;
+  }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  .panel {
+    position: fixed; top: 16px; left: 16px;
+    max-width: min(420px, calc(100vw - 32px));
+    padding: 14px 16px;
+    background: var(--panel);
+    border-radius: 12px;
+    box-shadow: 0 2px 12px #1d2a3a22;
+    font-size: 14px; line-height: 1.45;
+  }
+  .panel h1 { margin: 0 0 8px; font-size: 18px; font-weight: 600; }
+  .row { display: flex; gap: 8px; align-items: center; }
+  .link {
+    flex: 1; min-width: 0;
+    padding: 6px 8px; border: 1px solid var(--dot); border-radius: 8px;
+    font: inherit; color: var(--muted); background: #fff;
+  }
+  button {
+    font: inherit; font-weight: 600;
+    padding: 6px 12px; border: 0; border-radius: 8px;
+    background: var(--ink); color: #fff; cursor: pointer;
+  }
+  button:focus-visible, .link:focus-visible { outline: 2px solid #3b82f6; outline-offset: 2px; }
+  .status { margin-top: 8px; color: var(--muted); }
+  .status b { color: var(--ink); }
+  .dotst { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--wait); }
+  .dotst.ok { background: var(--ok); }
+  .hint { margin-top: 4px; color: var(--muted); }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="panel">
+  <h1>Кружечки</h1>
+  <div class="row">
+    <input class="link" id="link" readonly aria-label="Посилання на гру">
+    <button id="copy">Копіювати</button>
+  </div>
+  <div class="status"><span class="dotst" id="dot"></span><span id="status">Підключення до кімнати…</span></div>
+  <div class="hint">Рух — стрілки на клавіатурі</div>
+</div>
+
+<script type="module">
+import { joinRoom, selfId } from 'https://esm.run/trystero@0.25.4';
+
+// ---------- Кімната з URL ----------
+let roomId = location.hash.slice(1);
+if (!roomId) {
+  roomId = Math.random().toString(36).slice(2, 10);
+  history.replaceState(null, '', '#' + roomId);
+}
+const linkEl = document.getElementById('link');
+linkEl.value = location.href;
+document.getElementById('copy').onclick = async () => {
+  try { await navigator.clipboard.writeText(location.href); }
+  catch { linkEl.select(); document.execCommand('copy'); }
+  document.getElementById('copy').textContent = 'Скопійовано';
+  setTimeout(() => document.getElementById('copy').textContent = 'Копіювати', 1500);
+};
+
+// ---------- Світ ----------
+const WORLD_W = 1000, WORLD_H = 700, R = 22, SPEED = 320; // px/сек у координатах світу
+
+const me = {
+  x: R + Math.random() * (WORLD_W - 2 * R),
+  y: R + Math.random() * (WORLD_H - 2 * R),
+  c: `hsl(${Math.floor(Math.random() * 360)} 70% 55%)`,
+};
+
+// peerId -> { x, y, tx, ty, c }
+const peers = new Map();
+
+// ---------- P2P ----------
+const room = joinRoom({ appId: 'yurii-circles-demo-v1' }, roomId);
+const state = room.makeAction('state');
+
+function updateStatus() {
+  const n = peers.size;
+  document.getElementById('status').innerHTML =
+    n ? `Гравців у кімнаті: <b>${n + 1}</b>` : 'Ви в кімнаті. Надішліть посилання іншим';
+  document.getElementById('dot').classList.toggle('ok', n > 0);
+}
+updateStatus();
+
+room.onPeerJoin = (peerId) => {
+  // Новому гравцю одразу відправляємо свій стан
+  state.send(me, { target: peerId });
+};
+
+room.onPeerLeave = (peerId) => {
+  peers.delete(peerId);
+  updateStatus();
+};
+
+state.onMessage = (data, { peerId }) => {
+  const p = peers.get(peerId);
+  if (p) {
+    p.tx = data.x; p.ty = data.y; p.c = data.c;
+  } else {
+    peers.set(peerId, { x: data.x, y: data.y, tx: data.x, ty: data.y, c: data.c });
+    updateStatus();
+  }
+};
+
+// Розсилка власного стану ~20 разів/сек, тільки коли змінився
+let lastSent = '';
+setInterval(() => {
+  const s = `${Math.round(me.x)},${Math.round(me.y)}`;
+  if (s !== lastSent && peers.size) {
+    lastSent = s;
+    state.send({ x: Math.round(me.x), y: Math.round(me.y), c: me.c });
+  }
+}, 50);
+
+// ---------- Ввід ----------
+const keys = new Set();
+const ARROWS = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
+addEventListener('keydown', (e) => {
+  if (ARROWS.includes(e.key)) { keys.add(e.key); e.preventDefault(); }
+});
+addEventListener('keyup', (e) => keys.delete(e.key));
+addEventListener('blur', () => keys.clear());
+
+// ---------- Рендер ----------
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+let scale = 1, offX = 0, offY = 0;
+
+function resize() {
+  const dpr = devicePixelRatio || 1;
+  cv.width = innerWidth * dpr;
+  cv.height = innerHeight * dpr;
+  scale = Math.min(cv.width / WORLD_W, cv.height / WORLD_H);
+  offX = (cv.width - WORLD_W * scale) / 2;
+  offY = (cv.height - WORLD_H * scale) / 2;
+}
+addEventListener('resize', resize);
+resize();
+
+function drawCircle(x, y, color, mine) {
+  ctx.beginPath();
+  ctx.arc(x, y, R, 0, Math.PI * 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+  if (mine) {
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = '#1d2a3a';
+    ctx.stroke();
+  }
+}
+
+let prev = performance.now();
+function frame(now) {
+  const dt = Math.min((now - prev) / 1000, 0.1);
+  prev = now;
+
+  // Рух власного кружечка
+  let dx = 0, dy = 0;
+  if (keys.has('ArrowLeft')) dx -= 1;
+  if (keys.has('ArrowRight')) dx += 1;
+  if (keys.has('ArrowUp')) dy -= 1;
+  if (keys.has('ArrowDown')) dy += 1;
+  if (dx && dy) { dx *= Math.SQRT1_2; dy *= Math.SQRT1_2; }
+  me.x = Math.max(R, Math.min(WORLD_W - R, me.x + dx * SPEED * dt));
+  me.y = Math.max(R, Math.min(WORLD_H - R, me.y + dy * SPEED * dt));
+
+  // Згладжування позицій інших гравців
+  const k = 1 - Math.pow(0.001, dt);
+  for (const p of peers.values()) {
+    p.x += (p.tx - p.x) * k;
+    p.y += (p.ty - p.y) * k;
+  }
+
+  // Поле
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#cfd8e3';
+  ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.setTransform(scale, 0, 0, scale, offX, offY);
+  ctx.fillStyle = '#dfe6ee';
+  ctx.fillRect(0, 0, WORLD_W, WORLD_H);
+  ctx.fillStyle = '#c3ceda';
+  for (let x = 25; x < WORLD_W; x += 50)
+    for (let y = 25; y < WORLD_H; y += 50)
+      ctx.fillRect(x - 1.5, y - 1.5, 3, 3);
+
+  for (const p of peers.values()) drawCircle(p.x, p.y, p.c, false);
+  drawCircle(me.x, me.y, me.c, true);
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+addEventListener('beforeunload', () => room.leave());
+console.log('selfId:', selfId, 'room:', roomId);
+</script>
+</body>
+</html>
