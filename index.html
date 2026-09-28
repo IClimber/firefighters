@@ -977,9 +977,9 @@ if (isTouch) {
 
 function pour() {
   if (!me.full || game.phase !== 'play' || performance.now() < me.stunUntil) return;
+  me.full = false;                                            // вилити можна будь-де
   const i = cellAt(me.x, me.y - 4);
   if (i < 0 || game.grid[i] !== 'f') return;
-  me.full = false;
   game.grid[i] = 'x';
   steamAt[i] = performance.now();
   if (amHost()) {
