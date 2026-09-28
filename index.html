@@ -56,6 +56,7 @@
   .legend span { display: inline-flex; align-items: center; gap: 5px; }
   .sw { width: 11px; height: 11px; border-radius: 2px; display: inline-block; }
   .hint { margin-top: 6px; color: var(--muted); font-size: 12px; }
+  .warn { display: block; margin-top: 4px; color: var(--fire); font-size: 12px; }
 
   .overlay {
     position: fixed; inset: 0; display: none;
@@ -180,6 +181,10 @@ const SPREAD_RATE = 0.04;        // шанс/сек підпалити кожн�
 const START_FIRES = 3;           // скільки ділянок горить на старті
 const TICK = 0.25;               // крок симуляції вогню у хоста, сек
 const GRACE_MS = 3000;           // очікування інших гравців перед стартом власної гри
+const MAX_CATCHUP = 2;           // скільки секунд симуляції хост доганяє за один тік (довша пауза — це заморожена сторінка)
+const LIVE_MS = 3000;            // гравця, від якого стільки не було повідомлень, не малюємо і не обираємо хостом
+const RESUME_GAP_MS = 2000;      // пауза таймерів, після якої вважаємо, що сторінку було заморожено
+const FORGET_MS = 30000;         // через скільки забуваємо непрямого гравця, що замовк
 const FILL_X = RIVER_W + 22;     // лівіше цієї межі відро наповнюється
 
 // Машини
@@ -258,7 +263,9 @@ function cellAt(x, y) {
 }
 
 // ================= Стан =================
-const joinedAt = Date.now();
+// Місце в черзі на роль хоста: менше — раніше. Спершу це час входу, потім лише зростає
+// (після приєднання до чужої гри і після повернення з фону стаємо в кінець черги).
+let myStamp = Date.now();
 const me = {
   x: SHOULDER_X + 30 + Math.random() * (SHOULDER_W - 60),   // з'являємось на обочині, не на дорозі
   y: 240 + Math.random() * (H - 280),
@@ -266,8 +273,9 @@ const me = {
   face: 1, full: false, moving: false,
   stunUntil: 0, graceUntil: 0,
 };
-// peerId -> { t, x, y, tx, ty, hue, face, full, moving, hasPos }
+// peerId -> інший гравець: прямо підключений (direct) або відомий через ретранслятор
 const peers = new Map();
+const gone = new Set();                    // хто попрощався (bye): їхні запізнілі повідомлення ігноруємо
 // grid: 'g' ціла, 'f' горить, 'x' погашена, 'b' згоріла
 let game = { round: 0, grid: Array(N).fill('g'), ages: Array(N).fill(0), phase: 'wait' };
 let ready = false;
@@ -277,24 +285,49 @@ const steamAt = new Float64Array(N);       // час, коли ділянку п
 function getPeer(id) {
   let p = peers.get(id);
   if (!p) {
-    p = { t: null, x: W / 2, y: H / 2, tx: W / 2, ty: H / 2, hue: 0, face: 1, full: false, moving: false, stun: false, hasPos: false };
+    p = {
+      t: null, away: false, hasGame: false, links: null, direct: false, seen: 0, q: -1,
+      x: W / 2, y: H / 2, tx: W / 2, ty: H / 2, hue: 0, face: 1, full: false, moving: false, stun: false, hasPos: false,
+    };
     peers.set(id, p);
   }
   return p;
 }
+const isLive = (p, now = performance.now()) => now - p.seen < LIVE_MS;
+function livePeers() {
+  const now = performance.now();
+  let n = 0;
+  for (const p of peers.values()) if (isLive(p, now)) n++;
+  return n;
+}
+const directIds = () => [...peers].filter(([, p]) => p.direct).map(([id]) => id);
 
-// Хост — учасник, що зайшов найраніше (серед тих, про кого відомо)
+// Хост: спершу ті, у кого вже є гра, далі менший штамп, при рівності — менший id.
+// Хто відійшов (вкладка прихована) або мовчить довше LIVE_MS, хостом не стає, поки є інші кандидати.
 function hostId() {
-  let bestId = selfId, bestT = joinedAt;
-  for (const [id, p] of peers) {
-    if (p.t == null) continue;
-    if (p.t < bestT || (p.t === bestT && id < bestId)) { bestId = id; bestT = p.t; }
-  }
-  return bestId;
+  const now = performance.now();
+  let best = null, bestG = 0, bestT = 0;
+  const consider = (id, hasGame, t) => {
+    const g = hasGame ? 0 : 1;
+    if (best === null || g < bestG || (g === bestG && (t < bestT || (t === bestT && id < best)))) {
+      best = id; bestG = g; bestT = t;
+    }
+  };
+  const pick = (strict) => {
+    if (!strict || !document.hidden) consider(selfId, !!game.round, myStamp);
+    for (const [id, p] of peers) {
+      if (p.t == null || !isLive(p, now) || (strict && p.away)) continue;
+      consider(id, p.hasGame, p.t);
+    }
+  };
+  pick(true);
+  if (best === null) pick(false);
+  return best;
 }
 const amHost = () => hostId() === selfId;
 
-// Спільний час (годинник хоста) — від нього детерміновано рахуються машини
+// Спільний час, від нього детерміновано рахуються машини. Хост розсилає свій sharedNow(),
+// решта оцінює зсув. Новий хост зберігає свій зсув, тому при зміні хоста машини не стрибають.
 let clockOffset = 0, clockFrom = null;
 const clockSamples = [];
 function sampleClock(ht, from) {
@@ -303,23 +336,109 @@ function sampleClock(ht, from) {
   if (clockSamples.length > 12) clockSamples.shift();
   clockOffset = Math.max(...clockSamples);
 }
-const sharedNow = () => Date.now() + (amHost() ? 0 : clockOffset);
+const sharedNow = () => Date.now() + clockOffset;
+
+// Попередження про мережу для HUD
+const TURN_MISSING = 'Без TURN-сервера: гравці з інших мереж можуть не під\'єднатися.';
+let netWarn = '', netWarnUntil = 0, turnMissing = false;
+function warn(text, ms = 8000) {
+  netWarn = text;
+  netWarnUntil = performance.now() + ms;
+  updateHud();
+  setTimeout(updateHud, ms + 50);
+}
 
 // ================= P2P =================
+const APP_ID = 'yurii-firefighters-v1';
 const TURN_URL = 'https://144-172-110-72.sslip.io/turn.php';
-let turnConfig;
-try {
-  const res = await fetch(TURN_URL, { signal: AbortSignal.timeout(4000) });
-  if (res.ok) turnConfig = (await res.json()).iceServers;
-} catch (e) { console.warn('TURN недоступний, працюємо без нього', e); }
-const room = joinRoom(turnConfig ? { appId: 'yurii-firefighters-v1', turnConfig }
-                                 : { appId: 'yurii-firefighters-v1' }, roomId);
+const STUN_PROBE = 'stun:stun.cloudflare.com:3478';
+
+async function fetchTurn() {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 4000);
+  try {
+    const res = await fetch(TURN_URL, { signal: ctrl.signal });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const { iceServers } = await res.json();
+    if (!Array.isArray(iceServers) || !iceServers.length) throw new Error('порожня відповідь');
+    return iceServers;
+  } catch (e) {
+    console.warn('TURN недоступний, працюємо без нього', e);
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Чи проходить UDP назовні: є srflx-кандидат від STUN. Якщо ні (UDP заблоковано) — TURN потрібен усюди.
+function probeUdp(ms = 2500) {
+  return new Promise((resolve) => {
+    let pc = null, timer = 0;
+    const done = (ok) => {
+      clearTimeout(timer);
+      try { pc && pc.close(); } catch {}
+      resolve(ok);
+    };
+    timer = setTimeout(() => done(false), ms);
+    try {
+      pc = new RTCPeerConnection({ iceServers: [{ urls: STUN_PROBE }] });
+      pc.createDataChannel('probe');
+      pc.onicecandidate = (e) => {
+        if (!e.candidate) done(false);
+        else if (/ typ srflx /.test(e.candidate.candidate)) done(true);
+      };
+      pc.createOffer().then((o) => pc.setLocalDescription(o)).catch(() => done(false));
+    } catch { done(false); }
+  });
+}
+
+// Trystero тримає пул із 20 заздалегідь створених offer-з'єднань, і кожне займало б алокації на TURN.
+// Тому offer-з'єднання створюються без TURN, а TURN вмикається лише для з'єднання, що відповідає
+// на чужий offer (одного relay-кандидата з боку, що відповідає, досить). Якщо UDP заблоковано, TURN — усюди.
+const isTurnServer = (s) => [].concat(s.urls).some((u) => /^turns?:/.test(u));
+function lazyTurnPC(turnEverywhere) {
+  return class extends RTCPeerConnection {
+    constructor(cfg = {}) {
+      const lazy = !turnEverywhere;
+      super(lazy ? { ...cfg, iceServers: (cfg.iceServers || []).filter((s) => !isTurnServer(s)) } : cfg);
+      this.ffFullConfig = lazy ? cfg : null;
+    }
+    setRemoteDescription(desc) {
+      if (this.ffFullConfig && desc && desc.type === 'offer') {
+        try { this.setConfiguration(this.ffFullConfig); } catch (e) { console.warn('TURN не ввімкнувся', e); }
+        this.ffFullConfig = null;
+      }
+      return super.setRemoteDescription(desc);
+    }
+  };
+}
+
+const [iceServers, udpOk] = await Promise.all([fetchTurn(), probeUdp()]);
+turnMissing = !iceServers;
+const netConfig = { appId: APP_ID, password: roomId };      // пароль шифрує SDP на публічних релеях
+if (iceServers) {
+  netConfig.turnConfig = iceServers;
+  netConfig.rtcPolyfill = lazyTurnPC(!udpOk);
+}
+const room = joinRoom(netConfig, roomId, {
+  onJoinError: (e) => {
+    console.warn('Не вдалося з\'єднатися з гравцем', e);
+    warn('Не вдалося з\'єднатися з одним із гравців. Спробуйте іншу мережу.');
+  },
+});
 const helloA = room.makeAction('hello');
 const posA = room.makeAction('pos');
 const worldA = room.makeAction('world');
 const douseA = room.makeAction('douse');
 const restartA = room.makeAction('restart');
+const byeA = room.makeAction('bye');
+const fwdA = room.makeAction('fwd');
+const ACTIONS = { hello: helloA, pos: posA, world: worldA, douse: douseA, restart: restartA, bye: byeA };
+const BROADCAST = new Set(['hello', 'pos', 'world', 'bye']);   // розсилаються всім і ретранслюються
 
+const helloMsg = () => ({ t: myStamp, a: document.hidden ? 1 : 0, g: game.round ? 1 : 0, n: directIds() });
+const sendHello = (target) => safe(helloA.send(helloMsg(), target ? { target } : undefined));
+let posSeq = 0;
 const myPos = () => ({
   x: Math.round(me.x), y: Math.round(me.y), h: me.hue,
   f: me.face, b: me.full ? 1 : 0, m: me.moving ? 1 : 0,
@@ -328,70 +447,167 @@ const myPos = () => ({
 const worldMsg = () => ({
   r: game.round, g: game.grid.join(''),
   a: game.ages.map(v => Math.round(v * 10) / 10), p: game.phase,
-  ht: Date.now(),
+  ht: sharedNow(),
 });
+let lastWorldSent = 0;
 function sendWorld(target) {
   if (!game.round) return;
+  if (!target) lastWorldSent = performance.now();
   safe(worldA.send(worldMsg(), target ? { target } : undefined));
 }
 
+// Повідомлення конкретному гравцю (хосту): напряму або через спільного сусіда
+function sendTo(kind, data, to) {
+  const p = peers.get(to);
+  if (p && p.direct) return safe(ACTIONS[kind].send(data, { target: to }));
+  let via = null;
+  for (const [id, q] of peers) if (q.direct && q.links && q.links.has(to) && (via === null || id < via)) via = id;
+  if (via !== null) safe(fwdA.send({ k: kind, o: selfId, to, d: data }, { target: via }));
+}
+
+// Ретрансляція (неповний mesh): отримане напряму від `from` пересилаємо тим своїм сусідам,
+// у кого немає прямого з'єднання з `from`. Пересилає лише один — сусід із найменшим id серед спільних.
+function isRelayFor(from, to) {
+  const src = peers.get(from), dst = peers.get(to);
+  if (from === to || !src || !src.direct || !src.links || !dst || !dst.direct || !dst.links || dst.links.has(from)) return false;
+  for (const z of dst.links) if (z < selfId && z !== from && src.links.has(z)) return false;
+  return true;
+}
+function relayOut(kind, data, from) {
+  for (const [id, p] of peers) {
+    if (p.direct && isRelayFor(from, id)) safe(fwdA.send({ k: kind, o: from, d: data }, { target: id }));
+  }
+}
+// Новому сусідові одразу пересилаємо останні hello тих, з ким у нього немає прямого з'єднання
+function introduceTo(to) {
+  for (const [id, p] of peers) {
+    if (p.lastHello && isRelayFor(id, to)) safe(fwdA.send({ k: 'hello', o: id, d: p.lastHello }, { target: to }));
+  }
+}
+
+// ---------- Перевірка вхідних даних ----------
+const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
+const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+const GRID_RE = new RegExp(`^[gfxb]{${N}}$`);
+const PHASES = new Set(['play', 'win', 'lose']);
+function parseWorld(d) {
+  if (!isNum(d.r) || d.r <= 0 || typeof d.g !== 'string' || !GRID_RE.test(d.g) || !PHASES.has(d.p)) return null;
+  if (!Array.isArray(d.a) || d.a.length !== N || !d.a.every(isNum)) return null;
+  return { r: d.r, g: d.g, a: d.a.map(v => clamp(v, 0, BURN_TIME)), p: d.p, ht: isNum(d.ht) ? d.ht : null };
+}
+
+// ---------- Обробники ----------
+const ON = {
+  hello(d, id, p) {
+    if (!isNum(d.t)) return;
+    p.t = d.t;
+    p.away = !!d.a;
+    p.hasGame = !!d.g;
+    if (p.direct) {
+      p.lastHello = d;
+      const before = p.links;
+      if (Array.isArray(d.n)) p.links = new Set(d.n.filter(s => typeof s === 'string').slice(0, 64));
+      if (p.links && !(before && before.size === p.links.size && [...before].every(z => p.links.has(z)))) introduceTo(id);
+    }
+    updateHud();
+  },
+  pos(d, id, p) {
+    if (!isNum(d.x) || !isNum(d.y)) return;
+    if (isNum(d.q)) { if (d.q <= p.q) return; p.q = d.q; }   // дубль або застаріле через ретранслятор
+    const x = clamp(d.x, 0, W), y = clamp(d.y, 0, H);
+    if (!p.hasPos) { p.x = x; p.y = y; p.hasPos = true; }
+    p.tx = x; p.ty = y;
+    p.hue = isNum(d.h) ? Math.round(clamp(d.h, 0, 359)) : 0;
+    p.face = d.f === -1 ? -1 : 1;
+    p.full = !!d.b; p.moving = !!d.m; p.stun = !!d.s;
+  },
+  world(d, id) {
+    const w = parseWorld(d);
+    if (!w) return;
+    if (game.round && id !== hostId()) return;   // стан приймаємо тільки від хоста
+    const joined = !game.round;
+    ready = true;
+    if (w.ht !== null) sampleClock(w.ht, id);
+    const grid = w.g.split('');
+    if (w.r === game.round) {
+      const now = performance.now();
+      for (const [i, t0] of pending) {
+        if (now - t0 > 1500) pending.delete(i);
+        else if (grid[i] === 'f') grid[i] = 'x';
+      }
+    } else {
+      pending.clear();
+    }
+    applyGrid(grid);
+    game.round = w.r;
+    game.ages = w.a;
+    game.phase = w.p;
+    if (joined) restamp();                       // приєдналися до чужої гри — стаємо в кінець черги на хоста
+    updateHud();
+  },
+  douse(d, id, p) {
+    if (!amHost() || d.r !== game.round || game.phase !== 'play') return;
+    const i = d.i;
+    if (!Number.isInteger(i) || i < 0 || i >= N) return;
+    // гравець справді з повним відром і стоїть на цій ділянці (або поруч — поправка на затримку)
+    const at = p.hasPos ? cellAt(p.tx, p.ty - 4) : -1;
+    if (!p.full || at < 0 || (at !== i && !NEIGH[at].includes(i))) return;
+    p.full = false;
+    if (game.grid[i] === 'f') {
+      game.grid[i] = 'x';
+      steamAt[i] = performance.now();
+      checkEnd();
+      sendWorld();
+      updateHud();
+    }
+  },
+  restart(d) {
+    if (amHost() && d.r === game.round && game.phase !== 'play') newRound();
+  },
+  bye(d, id) {
+    gone.add(id);
+    peers.delete(id);
+    updateHud();
+  },
+};
+
+function receive(kind, d, from, relayed) {
+  if (typeof from !== 'string' || from === selfId || gone.has(from) || !d || typeof d !== 'object') return;
+  checkResume();
+  const p = getPeer(from);
+  p.seen = performance.now();
+  if (!relayed && BROADCAST.has(kind)) relayOut(kind, d, from);
+  ON[kind](d, from, p);
+}
+for (const [kind, action] of Object.entries(ACTIONS)) {
+  action.onMessage = (d, { peerId }) => receive(kind, d, peerId, false);
+}
+fwdA.onMessage = (m, { peerId }) => {
+  if (!m || typeof m !== 'object' || !Object.prototype.hasOwnProperty.call(ACTIONS, m.k) || typeof m.o !== 'string') return;
+  if (m.to != null) {                                           // адресне: доставити або передати далі (один стрибок)
+    if (m.to === selfId) receive(m.k, m.d, m.o, true);
+    else if (m.o === peerId && peers.get(m.to)?.direct) safe(fwdA.send(m, { target: m.to }));
+    return;
+  }
+  if (peers.get(m.o)?.direct) return;                           // з ним є пряме з'єднання, копія не потрібна
+  receive(m.k, m.d, m.o, true);
+};
+
 room.onPeerJoin = (id) => {
-  getPeer(id);
-  safe(helloA.send({ t: joinedAt }, { target: id }));
-  safe(posA.send(myPos(), { target: id }));
+  if (gone.has(id)) return;
+  const p = getPeer(id);
+  p.direct = true;
+  p.seen = performance.now();
+  sendHello();                                                  // список сусідів змінився — усім
+  safe(posA.send({ ...myPos(), q: posSeq++ }, { target: id }));
   if (amHost()) sendWorld(id);
   updateHud();
 };
 room.onPeerLeave = (id) => {
-  peers.delete(id);
+  const p = peers.get(id);
+  if (p) { p.direct = false; p.links = null; p.lastHello = null; }   // може лишатися досяжним через інших
+  sendHello();
   updateHud();
-};
-
-helloA.onMessage = (d, { peerId }) => {
-  getPeer(peerId).t = d.t;
-  updateHud();
-};
-
-posA.onMessage = (d, { peerId }) => {
-  const p = getPeer(peerId);
-  if (!p.hasPos) { p.x = d.x; p.y = d.y; p.hasPos = true; }
-  p.tx = d.x; p.ty = d.y; p.hue = d.h; p.face = d.f; p.full = !!d.b; p.moving = !!d.m; p.stun = !!d.s;
-};
-
-worldA.onMessage = (d, { peerId }) => {
-  if (peerId !== hostId() && game.round) return;   // стан приймаємо тільки від хоста
-  ready = true;
-  if (d.ht) sampleClock(d.ht, peerId);
-  const grid = d.g.split('');
-  if (d.r === game.round) {
-    const now = performance.now();
-    for (const [i, t0] of pending) {
-      if (now - t0 > 1500) pending.delete(i);
-      else if (grid[i] === 'f') grid[i] = 'x';
-    }
-  } else {
-    pending.clear();
-  }
-  applyGrid(grid);
-  game.round = d.r;
-  game.ages = d.a.slice();
-  game.phase = d.p;
-  updateHud();
-};
-
-douseA.onMessage = (d, { peerId }) => {
-  if (!amHost() || d.r !== game.round || game.phase !== 'play') return;
-  if (game.grid[d.i] === 'f') {
-    game.grid[d.i] = 'x';
-    steamAt[d.i] = performance.now();
-    checkEnd();
-    sendWorld();
-    updateHud();
-  }
-};
-
-restartA.onMessage = (d) => {
-  if (amHost() && d.r === game.round && game.phase !== 'play') newRound();
 };
 
 function applyGrid(grid) {
@@ -400,6 +616,22 @@ function applyGrid(grid) {
     if (game.grid[i] === 'f' && grid[i] === 'x') steamAt[i] = now;
   }
   game.grid = grid;
+}
+
+// Стати в кінець черги на роль хоста
+function restamp() {
+  let m = myStamp;
+  for (const p of peers.values()) if (p.t != null && p.t > m) m = p.t;
+  myStamp = m + 1;
+  sendHello();
+}
+
+// Сторінку було заморожено (телефон у фоні): роль хоста могли перейняти, не перебиваємо її
+let lastBeat = performance.now();
+function checkResume() {
+  const now = performance.now();
+  if (now - lastBeat > RESUME_GAP_MS && peers.size) restamp();
+  lastBeat = now;
 }
 
 // ================= Логіка вогню (тільки хост) =================
@@ -416,9 +648,11 @@ function newRound() {
     const n = NEIGH[b][Math.floor(Math.random() * NEIGH[b].length)];
     if (g[n] === 'g') { g[n] = 'f'; a[n] = Math.random() * 3; lit++; }
   }
+  const first = !game.round;
   game = { round: Math.max(Date.now(), game.round + 1), grid: g, ages: a, phase: 'play' };
   pending.clear();
   steamAt.fill(0);
+  if (first) sendHello();                                       // тепер у нас є гра
   sendWorld();
   updateHud();
 }
@@ -449,32 +683,76 @@ function hostTick(dt) {
   return changed || game.phase !== 'play';
 }
 
-let tickCount = 0;
+// Симуляція йде за реальним часом, а не за кількістю викликів таймера (у фоні його пригальмовують)
+let simLast = performance.now(), simAcc = 0, wasHost = false;
 setInterval(() => {
-  tickCount++;
-  if (!amHost()) return;
+  checkResume();
+  const now = performance.now();
+  const dt = Math.min((now - simLast) / 1000, MAX_CATCHUP);
+  simLast = now;
+  wasHost = amHost();
+  if (!wasHost) { simAcc = 0; return; }
   if (!game.round) {
     if (ready) newRound();
     return;
   }
   let changed = false;
-  if (game.phase === 'play') changed = hostTick(TICK);
-  if (changed || tickCount % 4 === 0) sendWorld();   // зміни — одразу, інакше раз на секунду
+  if (game.phase === 'play') {
+    simAcc += dt;
+    while (simAcc >= TICK && game.phase === 'play') {
+      simAcc -= TICK;
+      if (hostTick(TICK)) changed = true;
+    }
+  }
+  if (changed || now - lastWorldSent >= 1000) sendWorld();    // зміни — одразу, інакше раз на секунду
   if (changed) updateHud();
 }, TICK * 1000);
 
 setTimeout(() => { ready = true; updateHud(); }, GRACE_MS);
 
-// Розсилка власної позиції
+// Розсилка власної позиції; раз на 5 с — hello; прибирання забутих гравців
 let lastPos = '', lastPosT = 0;
 setInterval(() => {
-  if (!peers.size) return;
+  checkResume();
+  if (!directIds().length) return;
   const p = myPos(), s = JSON.stringify(p), now = performance.now();
   if (s !== lastPos || now - lastPosT > 1000) {
     lastPos = s; lastPosT = now;
-    safe(posA.send(p));
+    safe(posA.send({ ...p, q: posSeq++ }));
   }
 }, 50);
+let housekeep = 0, lastLive = -1;
+setInterval(() => {
+  const now = performance.now();
+  for (const [id, p] of peers) if (!p.direct && now - p.seen > FORGET_MS) peers.delete(id);
+  if (++housekeep % 5 === 0 && peers.size) sendHello();
+  const live = livePeers();
+  if (live !== lastLive) { lastLive = live; updateHud(); }   // хтось зник без прощання
+}, 1000);
+
+// Вкладка у фоні: віддаємо роль хоста, повернулися — стаємо в кінець черги
+document.addEventListener('visibilitychange', () => {
+  keys.clear(); touchKeys.clear();
+  if (document.hidden) {
+    if (wasHost) sendWorld();                                   // наступний хост отримає свіжий стан
+    sendHello();
+  } else {
+    restamp();
+  }
+  updateHud();
+});
+
+// Вихід: прощаємось явно, щоб інші прибрали гравця одразу
+let left = false;
+function leaveRoom() {
+  if (left) return;
+  left = true;
+  safe(byeA.send({}));
+  safe(room.leave());
+}
+addEventListener('pagehide', leaveRoom);
+addEventListener('pageshow', (e) => { if (e.persisted) location.reload(); });   // повернення з bfcache — з'єднання вже закриті
+addEventListener('hashchange', () => location.reload());                        // інша кімната в тій самій вкладці
 
 // ================= Ввід =================
 const keys = new Set();
@@ -552,7 +830,7 @@ function pour() {
     sendWorld();
   } else {
     pending.set(i, performance.now());
-    safe(douseA.send({ r: game.round, i }, { target: hostId() }));
+    sendTo('douse', { r: game.round, i }, hostId());
   }
   updateHud();
 }
@@ -560,12 +838,10 @@ function pour() {
 document.getElementById('restart').onclick = (e) => {
   e.currentTarget.blur();
   if (amHost()) newRound();
-  else safe(restartA.send({ r: game.round }, { target: hostId() }));
+  else sendTo('restart', { r: game.round }, hostId());
 };
 
 // ================= HUD =================
-const waitOv = document.getElementById('waitOv');
-const endOv = document.getElementById('endOv');
 function updateHud() {
   const c = { g: 0, f: 0, x: 0, b: 0 };
   for (const s of game.grid) c[s]++;
@@ -574,16 +850,19 @@ function updateHud() {
   document.getElementById('nX').textContent = c.x;
   document.getElementById('nB').textContent = c.b;
 
-  const n = peers.size + 1;
-  document.getElementById('status').innerHTML = isTouch
+  const n = livePeers() + 1;
+  let status = isTouch
     ? `Гравців: <b>${n}</b>`
     : n > 1
       ? `Гравців у кімнаті: <b>${n}</b>${amHost() ? ' (ви хост)' : ''}`
       : 'Ви в кімнаті самі. Надішліть посилання іншим';
+  const w = performance.now() < netWarnUntil ? netWarn : turnMissing ? TURN_MISSING : '';
+  if (w) status += `<span class="warn">${w}</span>`;               // лише власні константні рядки
+  document.getElementById('status').innerHTML = status;
 
-  waitOv.classList.toggle('show', !game.round);
+  document.getElementById('waitOv').classList.toggle('show', !game.round);
   const ended = game.phase === 'win' || game.phase === 'lose';
-  endOv.classList.toggle('show', ended);
+  document.getElementById('endOv').classList.toggle('show', ended);
   if (ended) {
     const card = document.getElementById('endCard');
     card.className = 'card ' + game.phase;
@@ -829,9 +1108,9 @@ function sprite(hue, frame, full) {
   spriteCache.set(key, c);
   return c;
 }
-function drawPlayer(x, y, hue, face, full, moving, mine, stun, t) {
+function drawPlayer(x, y, hue, face, full, moving, mine, stun, away, t) {
   const frame = moving && Math.floor(t * 7) % 2 ? 1 : 0;
-  ctx.globalAlpha = stun && Math.floor(t * 8) % 2 ? 0.2 : 1;
+  ctx.globalAlpha = (stun && Math.floor(t * 8) % 2 ? 0.2 : 1) * (away ? 0.4 : 1);
   ctx.fillStyle = 'rgba(0,0,0,0.28)';
   ctx.beginPath(); ctx.ellipse(x, y, 17, 5, 0, 0, Math.PI * 2); ctx.fill();
   ctx.save();
@@ -880,7 +1159,17 @@ function carsAt(T) {
   return out;
 }
 
-function rr(x, y, w, h, r) { ctx.beginPath(); ctx.roundRect(x, y, w, h, r); }
+// Заокруглений прямокутник через arcTo (ctx.roundRect немає в Safari до 16)
+function rr(x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
 // Машина малюється передом вниз (+y), для руху вгору розвертається на 180°
 function drawCar(c) {
   const hw = CAR_W / 2, hl = c.len / 2;
@@ -985,6 +1274,7 @@ resize();
 
 let prev = performance.now();
 function frame(now) {
+  requestAnimationFrame(frame);          // першим: виняток у кадрі не має зупиняти рендер назавжди
   const dt = Math.min((now - prev) / 1000, 0.1);
   prev = now;
   const t = now / 1000;
@@ -1058,17 +1348,18 @@ function frame(now) {
 
   // гравці, відсортовані по y
   const list = [];
-  for (const p of peers.values()) if (p.hasPos) list.push({ x: p.x, y: p.y, hue: p.hue, face: p.face, full: p.full, moving: p.moving, stun: p.stun, mine: false });
-  list.push({ x: me.x, y: me.y, hue: me.hue, face: me.face, full: me.full, moving: me.moving, stun: now < me.stunUntil, mine: true });
+  for (const p of peers.values()) {
+    // хто вийшов або замовк (закрив вкладку, телефон заблоковано) — не малюємо
+    if (p.hasPos && isLive(p, now)) list.push({ x: p.x, y: p.y, hue: p.hue, face: p.face, full: p.full, moving: p.moving, stun: p.stun, away: p.away, mine: false });
+  }
+  list.push({ x: me.x, y: me.y, hue: me.hue, face: me.face, full: me.full, moving: me.moving, stun: now < me.stunUntil, away: false, mine: true });
   list.sort((a, b) => a.y - b.y);
-  for (const p of list) drawPlayer(p.x, p.y, p.hue, p.face, p.full, p.moving, p.mine, p.stun, t);
+  for (const p of list) drawPlayer(p.x, p.y, p.hue, p.face, p.full, p.moving, p.mine, p.stun, p.away, t);
 
   ctx.restore();
-  requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
 
-addEventListener('beforeunload', () => room.leave());
 </script>
 </body>
 </html>
