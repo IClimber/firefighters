@@ -18,24 +18,32 @@
 - Мобільне керування: при `matchMedia('(pointer: coarse)')` — хрестовина на 8 напрямків (одна сенсорна зона) зліва внизу і кнопка «Вилити» справа, Pointer Events з мультитачем.
 
 ## Архітектура
-- Один файл `index.html` (HTML + CSS + JS-модуль), без збірки. Хоститься на GitHub Pages.
-- Мережа: WebRTC через Trystero (`https://esm.run/trystero@0.25.4`, стратегія Nostr за замовчуванням), `appId: 'yurii-firefighters-v1'`, `password: roomId` (шифрує SDP на публічних релеях).
+- Клієнт — один файл `index.html` (HTML + CSS + JS-модуль), без збірки і без зовнішніх JS-залежностей. Хоститься на GitHub Pages.
+- Сервер сигналізації — `server/signal.mjs` (Node, пакет `ws`), служба `ff-signal` на VPS за nginx: `wss://144-172-110-72.sslip.io/ws`. Він лише знайомить гравців кімнати і пересилає опис WebRTC-з'єднань; сама гра йде напряму між браузерами (P2P, `RTCPeerConnection` + DataChannel `data`, JSON `{k, d}`). Раніше пошук ішов через Trystero/публічні Nostr-релеї — це займало секунди і губило анонси, тому замінено.
 - Кімната — хеш URL (`#roomId`); якщо його нема, генерується. Вхід у гру — просто за посиланням.
 - Топологія mesh, але стан вогню авторитетний. Хост обирається так: спершу ті, в кого вже є гра (`hello.g`), далі менший штамп `t`, при рівності — менший id. Не беруть участі (поки є інші кандидати) ті, хто відійшов (вкладка прихована, `hello.a`) або мовчить довше `LIVE_MS` (3 с).
 - Штамп `myStamp` — місце в черзі: спершу `Date.now()` при вході, далі тільки зростає (`restamp` = max відомих + 1) — після приєднання до чужої гри, повернення вкладки з фону і після заморожування сторінки (пауза таймерів > `RESUME_GAP_MS`). Тому зсув годинника новачка і «розморожений» старий хост не перехоплюють роль.
 - Хост симулює вогонь за реальним часом (тіки по 0,25 с, догін не більше `MAX_CATCHUP`) і розсилає стан; при переході в фон одразу шле свіжий `world`, роль переходить наступному.
-- Новий учасник чекає `GRACE_MS` (3 с) перед створенням власної гри; якщо приходить стан від хоста — приймає його. Якщо цей пристрій грав у цій кімнаті з іншими в межах `RECENT_ROOM_MS` (30 хв; `localStorage['ff-room:<roomId>']`, оновлюється раз на 5 с, коли є живі гравці), чекає `LONG_GRACE_MS` (20 с) з кнопкою «Почати без них».
-- Пошук гравців: Trystero (Nostr) анонсує себе при вході (0, 233, 533, 1333 мс), далі раз на 60 с; анонси ефемерні (kind 20000–29999), підписка з `since: now()`. Хто пропустив анонс новачка (телефон у фоні, websocket перепідключався), знаходив його до хвилини — новачок тим часом починав власну гру. Тому, коли немає живого прямого сусіда (сусід із прихованою вкладкою вважається присутнім), гра перезаходить у кімнату (`rejoinRoom`: `leave()` + новий `joinRoom`, дії в `act` замінюються): через 10 с самотності, далі кожні 10 с до 1 хв, до 3 хв — кожні 20 с, потім раз на 60 с; а після повернення вкладки, події `online` чи розморожування сторінки — через `WAKE_CHECK_MS` (2,5 с), якщо ніхто живий не озвався. Перед перезаходом чекаємо, поки відкриється ≥ половина сокетів до релеїв (`getRelaySockets`, до 8 с): анонс у закритий сокет Trystero карає паузою анонсів на 60 с (`backoffRelay`). Перевірено на справжньому Trystero з релеями: без цього новачок чекав 51–58 с після пробудження іншого, з перезаходом — 1–2 с (а періодичний перезахід самотнього новачка — ~6 с).
+- Вхід: одразу `WebSocket` до сервера, `join` → `welcome` зі списком присутніх. Кімната порожня — гра стартує одразу (`startSolo` → `newRound`). Хтось є — чекаємо стан від хоста до `JOIN_WAIT_MS` (8 с, кнопка «Почати без них»), потім граємо самі (коли з'єднання встановиться, ігри зіллються: хост — менший штамп). Сервер не відповів за `GRACE_MS` (3 с) — граємо самі, HUD попереджає.
+- З'єднання: `selfId` — 20 випадкових символів на кожне завантаження сторінки. Offer завжди робить менший id (зустрічних offer-ів немає): новий у кімнаті (`welcome`/`joined`) — `connectTo`. Сигнали несуть `n` (id спроби), застарілі ігноруються; ICE-кандидати шлються лише після offer/answer, вхідні до `setRemoteDescription` буферизуються. Не відкрилося за `CONNECT_TIMEOUT_MS` (12 с), `failed`, `disconnected` довше `DISCONNECT_GRACE_MS` (5 с) чи закрився канал — `dropLink`, і якщо гравець ще в кімнаті, через `RETRY_MS` (2 с) менший id пробує знову, а більший шле йому `ask`. `left` від сервера закриває лише ще не відкрите з'єднання (відкрите P2P знає краще — сокет до сервера міг просто перепідключатися).
+- Зв'язок із сервером: при обриві — перепідключення з тим самим `selfId` (backoff 0,5 → 15 с; одразу — при поверненні вкладки, `online`, розморожуванні). Повторний `welcome`: до гравців без відкритого з'єднання — `connectTo` або `ask`. P2P при цьому не рветься.
 - Позиції гравців: кожен сам розсилає свою ~20 Гц, у інших — згладжування. Гравця, від якого немає повідомлень `LIVE_MS`, не малюють і не рахують; хто відійшов — напівпрозорий.
-- Вихід: на `pagehide` — `bye` і `room.leave()`; отримувачі одразу видаляють гравця і ігнорують його подальші повідомлення. `pageshow` з bfcache і `hashchange` — перезавантаження.
+- Вихід: на `pagehide` — `bye` через DataChannel і закриття WebSocket (сервер одразу шле `left`); WebRTC закриває сам браузер. Отримувачі `bye` одразу видаляють гравця, закривають з'єднання з ним і ігнорують його подальші повідомлення. `pageshow` з bfcache і `hashchange` — перезавантаження.
 - Неповний mesh: кожен у `hello.n` повідомляє прямих сусідів. Отримане напряму від X (`hello`, `pos`, `world`, `bye`) пересилається через `fwd` сусідам без прямого зв'язку з X; пересилає лише спільний сусід із найменшим id. Новому сусідові ретранслятор одразу шле останні `hello` недосяжних для нього гравців. Адресні `douse`/`restart` до хоста без прямого з'єднання йдуть через спільного сусіда (один стрибок).
 - Машини не передаються мережею: розклад детермінований від хешу roomId і спільного часу `sharedNow() = Date.now() + clockOffset`. Хост розсилає свій `sharedNow()` у `world.ht`, решта оцінює зсув як максимум `ht - Date.now()`; новий хост зберігає свій зсув, тому при зміні хоста машини не стрибають.
-- TURN: перед `joinRoom` паралельно `fetch` облікових даних (таймаут 4 с) і перевірка UDP (є srflx-кандидат від STUN, до 2,5 с). Через `rtcPolyfill` offer-з'єднання з пулу Trystero (20 шт.) створюються без TURN, TURN вмикається (`setConfiguration`) лише для з'єднання, що відповідає на offer; якщо UDP не проходить — TURN у всіх з'єднаннях. Інакше кожна вкладка тримала б ~40 алокацій.
+- ICE: STUN Google і Cloudflare + TURN, облікові дані якого (24 год, унікальне ім'я) сервер сигналізації дає прямо у `welcome`. Кожне з'єднання одразу з TURN (≈2 алокації на пару гравців; пулу offer-ів, як у Trystero, немає).
 - Усі вхідні повідомлення перевіряються (типи, межі, довжина сітки); хост приймає `douse`, лише якщо за останньою `pos` гравець має повне відро і стоїть на цій ділянці або сусідній. Від навмисного обману хостом у P2P захисту немає.
 - `requestAnimationFrame` викликається на початку кадру; `rr` малює через `arcTo` (без `ctx.roundRect`).
 - Зіткнення з машиною кожен гравець визначає локально для себе, прапорець оглушення йде в `pos`.
 
-### Повідомлення (Trystero actions)
+### Сервер сигналізації (`server/signal.mjs`)
+- Клієнт → сервер: `{t:'join', room, id}`, `{t:'signal', to, d}`. Сервер → клієнт: `{t:'welcome', peers, ice}`, `{t:'joined', id}`, `{t:'left', id}`, `{t:'signal', from, d}`, `{t:'full'}`.
+- `d` сигналу: `{n, sdp:{type, sdp}}`, `{n, c}` (ICE-кандидат) або `{n:'-', ask:1}`.
+- Повторний `join` з тим самим id замінює старий сокет (перепідключення). Кімната видаляється, коли порожня; стану гри сервер не зберігає.
+- Обмеження: кімната ≤ 16, ≤ 20 з'єднань з IP, 30 повідомлень/с (запас 300), `maxPayload` 16 КБ, ping кожні 15 с (не відповів — від'єднання), Origin лише з `FF_ORIGINS`. Логіка (`createSignalServer`) відокремлена від транспорту — тести запускають її з фейковими сокетами.
+- Налаштування через змінні середовища: `FF_HOST`, `FF_PORT`, `FF_ORIGINS`, `FF_TURN_SECRET_FILE`, `FF_TURN_URLS`.
+
+### Повідомлення гри (DataChannel, `act.<kind>.send(data, {target})`)
 - `hello` `{t (штамп), a (away), g (є гра), n (прямі сусіди)}` — при вході/виході сусідів, зміні стану і раз на 5 с.
 - `pos` `{x, y, h (hue), f (face), b (full), m (moving), s (stunned), q (номер, відкидаються старі)}`.
 - `world` `{r (round), g (рядок сітки), a (вік вогню по ділянках), p (phase: play|win|lose), ht (sharedNow хоста)}` — від хоста при змінах і раз на секунду.
@@ -45,7 +53,7 @@
 - `fwd` `{k (тип), o (автор), to? (адресат), d (дані)}` — ретрансляція.
 
 ### Світ
-Координати світу 900 × 600, клітинка 60, масштабування під екран з letterbox. Основні константи на початку скрипта: `BURN_TIME`, `SPREAD_RATE`, `START_FIRES`, `SPEED`, `CAR_SPEED`, `CAR_SLOT`, `CAR_CHANCE`, `STUN_MS`, `LIVE_MS`, `RESUME_GAP_MS`, `MAX_CATCHUP`, `LONG_GRACE_MS`, `RECENT_ROOM_MS`, `WAKE_CHECK_MS`.
+Координати світу 900 × 600, клітинка 60, масштабування під екран з letterbox. Основні константи на початку скрипта: `BURN_TIME`, `SPREAD_RATE`, `START_FIRES`, `SPEED`, `CAR_SPEED`, `CAR_SLOT`, `CAR_CHANCE`, `STUN_MS`, `LIVE_MS`, `RESUME_GAP_MS`, `MAX_CATCHUP`, `GRACE_MS`, `JOIN_WAIT_MS`, `CONNECT_TIMEOUT_MS`, `DISCONNECT_GRACE_MS`, `RETRY_MS`.
 
 ## Поточний стан
 - Гра працює і опублікована на GitHub Pages; мобільне керування працює.
@@ -54,8 +62,9 @@
   - TURN/TLS на 443: nginx `stream` (`/etc/nginx/stream.d/ff-turn.conf`, модуль `libnginx-mod-stream`) ділить 443 за ALPN: без ALPN або `stun.turn` → `127.0.0.1:4431` (nginx знімає TLS і шле TURN/TCP у coturn 3478), решта → HTTPS на `127.0.0.1:4430` з `proxy_protocol` (справжня IP через `real_ip_header proxy_protocol`).
   - Секрет: `/etc/ff-turn/secret` (root:www-data 640), його читають coturn (у конфігу) і PHP.
   - Ендпоінт: `https://144-172-110-72.sslip.io/turn.php` (`/var/www/ff-turn/turn.php`, nginx `/etc/nginx/sites-available/ff-turn`), `limit_req` 6/хв + burst 10 з IP. Облікові дані на 24 год з унікальним ім'ям `<expiry>:<random>` на кожен запит; URL `turn:144.172.110.72:3478?transport=udp` і `turns:144-172-110-72.sslip.io:443?transport=tcp`. CORS лише для `https://iclimber.github.io`. Сертифікат Let's Encrypt, автопродовження `certbot.timer` (nginx при продовженні перезавантажується, stream підхоплює новий сертифікат).
-  - Гра перед `joinRoom` отримує `iceServers` (див. «TURN» в архітектурі); при помилці — без TURN і з попередженням у HUD.
-- Автозапуск: `coturn`, `nginx`, `php8.3-fpm`, `certbot.timer` увімкнені в systemd; для coturn drop-in `/etc/systemd/system/coturn.service.d/override.conf` (`After=network-online.target`, `Restart=on-failure`), бо він прив'язаний до конкретної IP.
+  - Нова гра `turn.php` не використовує (облікові дані TURN видає сервер сигналізації); ендпоінт лишився.
+  - Сервер сигналізації: `/opt/ff-signal/signal.mjs` (копія `server/signal.mjs`), служба `/etc/systemd/system/ff-signal.service` (з `server/ff-signal.service`; `DynamicUser`, група `www-data` для читання секрету TURN, `NODE_PATH=/usr/share/nodejs`), Node 18 і `ws` з apt (`nodejs`, `node-ws`), слухає `127.0.0.1:8090`; nginx `location = /ws` у сайті `ff-turn` (`limit_req` 30/хв + burst 20). Оновлення коду сервера: `install -m 644 server/signal.mjs /opt/ff-signal/signal.mjs && systemctl restart ff-signal`.
+- Автозапуск: `coturn`, `nginx`, `php8.3-fpm`, `certbot.timer`, `ff-signal` увімкнені в systemd; для coturn drop-in `/etc/systemd/system/coturn.service.d/override.conf` (`After=network-online.target`, `Restart=on-failure`), бо він прив'язаний до конкретної IP.
 - `user-quota` рахується за частиною імені після `:`, тому `turn.php` робить її унікальною на кожен запит — квота діє на одне завантаження сторінки.
 - Фаєрвол ufw: вхідні лише 22, 80, 443/tcp, 3478/udp, 49152–65535/udp (3478/tcp назовні закритий, nginx ходить у coturn локально). avahi вимкнено.
 - Зміни 28.09.2026 застосовано скриптом `/root/ff-server-changes/apply.sh`; попередні конфіги — `/root/ff-backup-20260928/`.
@@ -278,9 +287,39 @@ timeout 20 turnutils_uclient -y -n 1 -m 1 -u "$U" -w "$P" $IP 2>&1 | grep "lost 
 timeout 20 turnutils_uclient -y -S -t -p 443 -n 1 -m 1 -u "$U" -w "$P" $IP 2>&1 | grep "lost packets"  # TLS 443
 certbot renew --dry-run 2>&1 | tail -2
 ```
-Після цього в `index.html` замінити `TURN_URL` на `https://$HOST/turn.php`, закомітити й запушити; оновити IP і шляхи в розділі «Поточний стан». Якщо гра переїде з `https://iclimber.github.io`, змінити `$allowed` у `turn.php`.
+Сервер сигналізації (з клону репозиторію в `/root/firefighters`):
+```bash
+DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs node-ws
+install -d -m 755 /opt/ff-signal
+install -m 644 /root/firefighters/server/signal.mjs /opt/ff-signal/signal.mjs
+sed "s/__IP__/$IP/g; s/__HOST__/$HOST/g" /root/firefighters/server/ff-signal.service > /etc/systemd/system/ff-signal.service
+systemctl daemon-reload && systemctl enable --now ff-signal
+# у /etc/nginx/sites-available/ff-turn: після limit_req_zone ffturn
+#   limit_req_zone $binary_remote_addr zone=ffws:1m rate=30r/m;
+# і перед `location / { return 404; }` у HTTPS-сервері:
+#   location = /ws {
+#       limit_req zone=ffws burst=20 nodelay;
+#       limit_req_status 429;
+#       proxy_pass http://127.0.0.1:8090;
+#       proxy_http_version 1.1;
+#       proxy_set_header Upgrade $http_upgrade;
+#       proxy_set_header Connection "upgrade";
+#       proxy_set_header X-Real-IP $remote_addr;
+#       proxy_read_timeout 1h;
+#       proxy_send_timeout 1h;
+#   }
+nginx -t && systemctl reload nginx
+NODE_PATH=/usr/share/nodejs node -e "
+const W = require('ws'); const s = new W('wss://$HOST/ws', { origin: 'https://iclimber.github.io', ALPNProtocols: ['http/1.1'] });  // без ALPN nginx відправить у TURN/TLS
+s.on('open', () => s.send(JSON.stringify({ t: 'join', room: 'selfcheck', id: 'selfcheck01' })));
+s.on('message', (m) => { console.log(String(m).slice(0, 60)); process.exit(0); });
+setTimeout(() => { console.log('ТАЙМАУТ'); process.exit(1); }, 5000);"   # очікується welcome з непорожнім ice
+```
+Після цього в `index.html` замінити `SIGNAL_URL` на `wss://$HOST/ws`, закомітити й запушити; оновити IP і шляхи в розділі «Поточний стан». Якщо гра переїде з `https://iclimber.github.io`, змінити `FF_ORIGINS` у службі і `$allowed` у `turn.php`.
 
 ## Тестування
 Реальну мережу з пісочниці перевірити не вдається, тому для тестів мережевий шар підмінявся заглушкою на BroadcastChannel (кілька вкладок у Playwright), а для мобільного керування — емуляція телефона з touch-подіями через CDP.
-На VPS браузера немає: мережеву логіку перевіряли в Node — скрипт гри в кількох `vm`-контекстах із фейковим DOM/canvas і фейковим Trystero (блокування пар для неповного mesh, заморожування, вбивство без `bye`, зсув годинника).
-Поведінку самого Trystero/релеїв перевіряли в Node зі справжнім `trystero@0.25.4` і WebRTC-поліфілом `node-datachannel` (окремі процеси-учасники; «сон» — SIGSTOP плюс закриття сокетів через `pauseRelayReconnection` і `getRelaySockets()`).
+На VPS браузера немає, тому перевіряли в Node:
+- логіка: скрипт гри в кількох `vm`-контекстах із фейковим DOM/canvas, справжньою логікою сервера (`createSignalServer`) і фейковими `WebSocket`/`RTCPeerConnection` (блокування P2P-пар для неповного mesh, заморожування, вбивство без `bye`, обрив сокета сервером, зсув годинника);
+- наживо: справжній `ws`-сервер, справжній WebRTC (`node-datachannel`), Node `WebSocket` — вхід, перезаходи, вихід. У `node-datachannel` (libjuice) DataChannel з STUN відкривається ~1 с (чекає STUN / повторює першу ICE-перевірку), без STUN — десятки мс; у браузерах такого очікування немає.
+- `signal.mjs` перевірено на Node 18.19.1 з `ws` із пакета `node-ws` (як на сервері).
