@@ -150,7 +150,7 @@
 </div>
 
 <div class="overlay" id="waitOv">
-  <div class="card"><h2>Пошук гравців</h2><p>Підключаємось до кімнати…</p></div>
+  <div class="card"><h2>Пошук гравців</h2><p id="waitText">Підключаємось до кімнати…</p><button id="soloBtn" hidden>Почати без них</button></div>
 </div>
 
 <div class="overlay" id="endOv">
@@ -162,7 +162,7 @@
 </div>
 
 <script type="module">
-import { joinRoom, selfId } from 'https://esm.run/trystero@0.25.4';
+import { joinRoom, selfId, getRelaySockets } from 'https://esm.run/trystero@0.25.4';
 
 // ================= Налаштування =================
 const CELL = 60;                 // розмір ділянки посадки (одиниці світу)
@@ -181,6 +181,9 @@ const SPREAD_RATE = 0.04;        // шанс/сек підпалити кожн�
 const START_FIRES = 3;           // скільки ділянок горить на старті
 const TICK = 0.25;               // крок симуляції вогню у хоста, сек
 const GRACE_MS = 3000;           // очікування інших гравців перед стартом власної гри
+const LONG_GRACE_MS = 20000;     // те саме, якщо цей пристрій нещодавно грав у цій кімнаті з іншими
+const RECENT_ROOM_MS = 30 * 60000; // «нещодавно» — у межах 30 хв
+const WAKE_CHECK_MS = 2500;      // після пробудження стільки чекаємо живих повідомлень, перш ніж шукати заново
 const MAX_CATCHUP = 2;           // скільки секунд симуляції хост доганяє за один тік (довша пауза — це заморожена сторінка)
 const LIVE_MS = 3000;            // гравця, від якого стільки не було повідомлень, не малюємо і не обираємо хостом
 const RESUME_GAP_MS = 2000;      // пауза таймерів, після якої вважаємо, що сторінку було заморожено
@@ -420,24 +423,27 @@ if (iceServers) {
   netConfig.turnConfig = iceServers;
   netConfig.rtcPolyfill = lazyTurnPC(!udpOk);
 }
-const room = joinRoom(netConfig, roomId, {
-  onJoinError: (e) => {
-    console.warn('Не вдалося з\'єднатися з гравцем', e);
-    warn('Не вдалося з\'єднатися з одним із гравців. Спробуйте іншу мережу.');
-  },
-});
-const helloA = room.makeAction('hello');
-const posA = room.makeAction('pos');
-const worldA = room.makeAction('world');
-const douseA = room.makeAction('douse');
-const restartA = room.makeAction('restart');
-const byeA = room.makeAction('bye');
-const fwdA = room.makeAction('fwd');
-const ACTIONS = { hello: helloA, pos: posA, world: worldA, douse: douseA, restart: restartA, bye: byeA };
+const KINDS = ['hello', 'pos', 'world', 'douse', 'restart', 'bye'];
 const BROADCAST = new Set(['hello', 'pos', 'world', 'bye']);   // розсилаються всім і ретранслюються
+// Поточна кімната Trystero і її дії; при перезаході (див. rejoinRoom) замінюються
+let room = null;
+const act = {};
+function openRoom() {
+  room = joinRoom(netConfig, roomId, {
+    onJoinError: (e) => {
+      console.warn('Не вдалося з\'єднатися з гравцем', e);
+      warn('Не вдалося з\'єднатися з одним із гравців. Спробуйте іншу мережу.');
+    },
+  });
+  for (const kind of [...KINDS, 'fwd']) act[kind] = room.makeAction(kind);
+  for (const kind of KINDS) act[kind].onMessage = (d, { peerId }) => receive(kind, d, peerId, false);
+  act.fwd.onMessage = onFwd;
+  room.onPeerJoin = onPeerJoin;
+  room.onPeerLeave = onPeerLeave;
+}
 
 const helloMsg = () => ({ t: myStamp, a: document.hidden ? 1 : 0, g: game.round ? 1 : 0, n: directIds() });
-const sendHello = (target) => safe(helloA.send(helloMsg(), target ? { target } : undefined));
+const sendHello = (target) => safe(act.hello.send(helloMsg(), target ? { target } : undefined));
 let posSeq = 0;
 const myPos = () => ({
   x: Math.round(me.x), y: Math.round(me.y), h: me.hue,
@@ -453,16 +459,16 @@ let lastWorldSent = 0;
 function sendWorld(target) {
   if (!game.round) return;
   if (!target) lastWorldSent = performance.now();
-  safe(worldA.send(worldMsg(), target ? { target } : undefined));
+  safe(act.world.send(worldMsg(), target ? { target } : undefined));
 }
 
 // Повідомлення конкретному гравцю (хосту): напряму або через спільного сусіда
 function sendTo(kind, data, to) {
   const p = peers.get(to);
-  if (p && p.direct) return safe(ACTIONS[kind].send(data, { target: to }));
+  if (p && p.direct) return safe(act[kind].send(data, { target: to }));
   let via = null;
   for (const [id, q] of peers) if (q.direct && q.links && q.links.has(to) && (via === null || id < via)) via = id;
-  if (via !== null) safe(fwdA.send({ k: kind, o: selfId, to, d: data }, { target: via }));
+  if (via !== null) safe(act.fwd.send({ k: kind, o: selfId, to, d: data }, { target: via }));
 }
 
 // Ретрансляція (неповний mesh): отримане напряму від `from` пересилаємо тим своїм сусідам,
@@ -475,13 +481,13 @@ function isRelayFor(from, to) {
 }
 function relayOut(kind, data, from) {
   for (const [id, p] of peers) {
-    if (p.direct && isRelayFor(from, id)) safe(fwdA.send({ k: kind, o: from, d: data }, { target: id }));
+    if (p.direct && isRelayFor(from, id)) safe(act.fwd.send({ k: kind, o: from, d: data }, { target: id }));
   }
 }
 // Новому сусідові одразу пересилаємо останні hello тих, з ким у нього немає прямого з'єднання
 function introduceTo(to) {
   for (const [id, p] of peers) {
-    if (p.lastHello && isRelayFor(id, to)) safe(fwdA.send({ k: 'hello', o: id, d: p.lastHello }, { target: to }));
+    if (p.lastHello && isRelayFor(id, to)) safe(act.fwd.send({ k: 'hello', o: id, d: p.lastHello }, { target: to }));
   }
 }
 
@@ -579,36 +585,88 @@ function receive(kind, d, from, relayed) {
   if (!relayed && BROADCAST.has(kind)) relayOut(kind, d, from);
   ON[kind](d, from, p);
 }
-for (const [kind, action] of Object.entries(ACTIONS)) {
-  action.onMessage = (d, { peerId }) => receive(kind, d, peerId, false);
-}
-fwdA.onMessage = (m, { peerId }) => {
-  if (!m || typeof m !== 'object' || !Object.prototype.hasOwnProperty.call(ACTIONS, m.k) || typeof m.o !== 'string') return;
+function onFwd(m, { peerId }) {
+  if (!m || typeof m !== 'object' || !KINDS.includes(m.k) || typeof m.o !== 'string') return;
   if (m.to != null) {                                           // адресне: доставити або передати далі (один стрибок)
     if (m.to === selfId) receive(m.k, m.d, m.o, true);
-    else if (m.o === peerId && peers.get(m.to)?.direct) safe(fwdA.send(m, { target: m.to }));
+    else if (m.o === peerId && peers.get(m.to)?.direct) safe(act.fwd.send(m, { target: m.to }));
     return;
   }
   if (peers.get(m.o)?.direct) return;                           // з ним є пряме з'єднання, копія не потрібна
   receive(m.k, m.d, m.o, true);
-};
+}
 
-room.onPeerJoin = (id) => {
+function onPeerJoin(id) {
   if (gone.has(id)) return;
   const p = getPeer(id);
   p.direct = true;
   p.seen = performance.now();
   sendHello();                                                  // список сусідів змінився — усім
-  safe(posA.send({ ...myPos(), q: posSeq++ }, { target: id }));
+  safe(act.pos.send({ ...myPos(), q: posSeq++ }, { target: id }));
   if (amHost()) sendWorld(id);
   updateHud();
-};
-room.onPeerLeave = (id) => {
+}
+function onPeerLeave(id) {
   const p = peers.get(id);
   if (p) { p.direct = false; p.links = null; p.lastHello = null; }   // може лишатися досяжним через інших
   sendHello();
   updateHud();
-};
+}
+
+openRoom();
+
+// Trystero анонсує себе в кімнаті лише при вході (кілька разів за ~2 с), далі раз на 60 с, а анонси
+// на релеях не зберігаються. Якщо інший гравець у цей момент не слухав (телефон у фоні, websocket
+// перепідключався), знайдемо одне одного лише за хвилину. Тому, коли ми самі, перезаходимо в кімнату —
+// це дає свіжі анонси. Анонс у ще закритий сокет Trystero карає паузою анонсів на 60 с,
+// тож спершу чекаємо, поки відкриється хоча б половина сокетів до релеїв.
+// Сусід із прихованою вкладкою може мовчати довго (таймери у фоні пригальмовані) — він присутній,
+// поки Trystero не закрив з'єднання; інакше ми б розривали живе з'єднання кожні 10 с.
+const liveDirect = () => { const now = performance.now(); return [...peers.values()].some(p => p.direct && (p.away || isLive(p, now))); };
+function relayOpenShare() {
+  try {
+    const list = Object.values(getRelaySockets() || {});
+    return list.length ? list.filter(s => s && s.readyState === 1).length / list.length : 1;
+  } catch { return 1; }
+}
+let rejoining = false;
+async function rejoinRoom() {
+  if (rejoining || left || liveDirect()) return;
+  rejoining = true;
+  try {
+    const t0 = performance.now();
+    while (relayOpenShare() < 0.5 && performance.now() - t0 < 8000) await new Promise(r => setTimeout(r, 250));
+    if (left || liveDirect()) return;
+    const old = room;
+    old.onPeerJoin = null;
+    old.onPeerLeave = null;
+    await old.leave();
+    if (left) return;
+    for (const p of peers.values()) { p.direct = false; p.links = null; p.lastHello = null; }
+    openRoom();
+    updateHud();
+  } catch (e) {
+    console.warn('Не вдалося перезайти в кімнату', e);
+  } finally {
+    rejoining = false;
+  }
+}
+// Коли самі: перша спроба через 10 с, далі кожні 10 с першу хвилину, до 3 хв — кожні 20 с, потім раз на хвилину
+let aloneSince = null, nextRejoinAt = 0;
+function scheduleRejoin(now) {
+  if (liveDirect()) { aloneSince = null; return; }
+  if (aloneSince === null) { aloneSince = now; nextRejoinAt = Math.max(nextRejoinAt, now + 10000); }
+  if (now < nextRejoinAt) return;
+  const alone = now - aloneSince;
+  nextRejoinAt = now + (alone < 60000 ? 10000 : alone < 180000 ? 20000 : 60000);
+  rejoinRoom();
+}
+// Повернулися з фону / з'явилася мережа: якщо за WAKE_CHECK_MS ніхто живий не озвався — шукаємо заново
+function onWake() {
+  aloneSince = null;
+  nextRejoinAt = performance.now() + WAKE_CHECK_MS;
+}
+addEventListener('online', onWake);
 
 function applyGrid(grid) {
   const now = performance.now();
@@ -630,7 +688,10 @@ function restamp() {
 let lastBeat = performance.now();
 function checkResume() {
   const now = performance.now();
-  if (now - lastBeat > RESUME_GAP_MS && peers.size) restamp();
+  if (now - lastBeat > RESUME_GAP_MS) {
+    if (peers.size) restamp();
+    onWake();
+  }
   lastBeat = now;
 }
 
@@ -708,7 +769,18 @@ setInterval(() => {
   if (changed) updateHud();
 }, TICK * 1000);
 
-setTimeout(() => { ready = true; updateHud(); }, GRACE_MS);
+// Якщо цей пристрій нещодавно грав у цій кімнаті з іншими, при вході чекаємо їх довше:
+// інакше, поки з'єднання встановлюється, почалася б нова гра, схожа на іншу кімнату.
+const ROOM_KEY = 'ff-room:' + roomId;
+let recentRoom = false;
+try { recentRoom = Date.now() - Number(localStorage.getItem(ROOM_KEY) || 0) < RECENT_ROOM_MS; } catch {}
+function startSolo() {
+  if (ready) return;
+  ready = true;
+  updateHud();
+}
+setTimeout(startSolo, recentRoom ? LONG_GRACE_MS : GRACE_MS);
+document.getElementById('soloBtn').onclick = (e) => { e.currentTarget.blur(); startSolo(); };
 
 // Розсилка власної позиції; раз на 5 с — hello; прибирання забутих гравців
 let lastPos = '', lastPosT = 0;
@@ -718,7 +790,7 @@ setInterval(() => {
   const p = myPos(), s = JSON.stringify(p), now = performance.now();
   if (s !== lastPos || now - lastPosT > 1000) {
     lastPos = s; lastPosT = now;
-    safe(posA.send({ ...p, q: posSeq++ }));
+    safe(act.pos.send({ ...p, q: posSeq++ }));
   }
 }, 50);
 let housekeep = 0, lastLive = -1;
@@ -728,6 +800,8 @@ setInterval(() => {
   if (++housekeep % 5 === 0 && peers.size) sendHello();
   const live = livePeers();
   if (live !== lastLive) { lastLive = live; updateHud(); }   // хтось зник без прощання
+  if (live && housekeep % 5 === 0) { try { localStorage.setItem(ROOM_KEY, String(Date.now())); } catch {} }
+  scheduleRejoin(now);
 }, 1000);
 
 // Вкладка у фоні: віддаємо роль хоста, повернулися — стаємо в кінець черги
@@ -738,6 +812,7 @@ document.addEventListener('visibilitychange', () => {
     sendHello();
   } else {
     restamp();
+    onWake();
   }
   updateHud();
 });
@@ -747,7 +822,7 @@ let left = false;
 function leaveRoom() {
   if (left) return;
   left = true;
-  safe(byeA.send({}));
+  safe(act.bye.send({}));
   safe(room.leave());
 }
 addEventListener('pagehide', leaveRoom);
@@ -861,6 +936,10 @@ function updateHud() {
   document.getElementById('status').innerHTML = status;
 
   document.getElementById('waitOv').classList.toggle('show', !game.round);
+  const longWait = !game.round && recentRoom && !ready;
+  document.getElementById('waitText').textContent = longWait
+    ? 'Підключаємось до гравців, які були в цій кімнаті…' : 'Підключаємось до кімнати…';
+  document.getElementById('soloBtn').hidden = !longWait;
   const ended = game.phase === 'win' || game.phase === 'lose';
   document.getElementById('endOv').classList.toggle('show', ended);
   if (ended) {
