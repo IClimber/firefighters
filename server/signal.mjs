@@ -1,21 +1,67 @@
-// Сервер сигналізації Firefighters: лише знайомить гравців кімнати і пересилає опис WebRTC-з'єднань.
+// Сервер сигналізації P2P-ігор (клієнт — net.js): лише знайомить гравців кімнати і пересилає опис WebRTC-з'єднань.
 // Сама гра йде напряму між браузерами (DataChannel), через сервер вона не проходить.
 //
+// Протокол двійковий: перший байт — тип, рядки — UTF-8 з довжиною (varint LEB128), списки — кількість (varint) і елементи.
 // Клієнт → сервер:
-//   {t:'join', room, id}          — вхід у кімнату (id генерує клієнт на кожне завантаження сторінки)
-//   {t:'signal', to, d}           — offer/answer/ICE для іншого гравця кімнати
+//   1 join    [версія протоколу u8][гра][кімната][id]   — id генерує клієнт на кожне завантаження сторінки
+//   2 signal  [кому][дані…]                              — offer/answer/ICE для іншого гравця; дані сервер не розбирає
 // Сервер → клієнт:
-//   {t:'welcome', peers:[id], ice:[RTCIceServer]} — хто вже в кімнаті + тимчасові облікові дані TURN
-//   {t:'joined', id} / {t:'left', id}             — хтось зайшов (або перепідключився) / вийшов
-//   {t:'signal', from, d}
-//   {t:'full'}                                    — кімната заповнена
+//   1 welcome [[id]][[[url] username credential]]        — хто вже в кімнаті + тимчасові облікові дані TURN
+//   2 joined  [id] / 3 left [id]                          — хтось зайшов (або перепідключився) / вийшов
+//   4 signal  [від кого][дані…]
+//   5 full                                                — кімната заповнена
+// Закриття: 4001 некоректний join, 4002 кімната заповнена, 4003 замінено новим з'єднанням з тим самим id,
+// 4005 інша версія протоколу (сторінку треба оновити), 4008 перевищено ліміт повідомлень, 4029 забагато з'єднань з IP.
 import { createHmac, randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 
+const PROTOCOL = 2;
+const GAME_RE = /^[a-z0-9-]{1,32}$/;
 const ROOM_RE = /^[A-Za-z0-9_-]{1,64}$/;
 const ID_RE = /^[A-Za-z0-9]{8,32}$/;
+const IN = { join: 1, signal: 2 };
+const OUT = { welcome: 1, joined: 2, left: 3, signal: 4, full: 5 };
+
+// ---------- Двійковий формат ----------
+function varint(v) {
+  const out = [];
+  while (v >= 128) { out.push((v % 128) | 128); v = Math.floor(v / 128); }
+  out.push(v);
+  return Buffer.from(out);
+}
+// Рядок — з довжиною, масив — список (кількість і елементи), Buffer — як є
+function message(type, ...parts) {
+  const bufs = [Buffer.from([type])];
+  const add = (x) => {
+    if (Buffer.isBuffer(x)) bufs.push(x);
+    else if (Array.isArray(x)) { bufs.push(varint(x.length)); x.forEach(add); }
+    else if (typeof x === 'string') { const b = Buffer.from(x, 'utf8'); bufs.push(varint(b.length), b); }
+  };
+  parts.forEach(add);
+  return Buffer.concat(bufs);
+}
+function reader(buf) {
+  let p = 0;
+  const need = (k) => { if (p + k > buf.length) throw new RangeError('short'); };
+  const r = {
+    u8: () => { need(1); return buf[p++]; },
+    uv: () => {
+      let v = 0, m = 1;
+      for (;;) {
+        const b = r.u8();
+        v += (b & 127) * m;
+        if (b < 128) return v;
+        m *= 128;
+        if (m > 2 ** 35) throw new RangeError('varint');
+      }
+    },
+    str: () => { const k = r.uv(); need(k); const s = buf.toString('utf8', p, p + k); p += k; return s; },
+    rest: () => { const b = buf.subarray(p); p = buf.length; return b; },
+  };
+  return r;
+}
 
 export function createSignalServer({
   maxRoom = 16,                 // гравців у кімнаті
@@ -30,7 +76,7 @@ export function createSignalServer({
   const rooms = new Map();      // roomId -> Map(id -> client)
   const perIp = new Map();
 
-  const send = (c, msg) => { try { c.ws.send(JSON.stringify(msg)); } catch {} };
+  const send = (c, msg) => { try { c.ws.send(msg); } catch {} };
   const broadcast = (room, msg, except) => {
     for (const c of room.values()) if (c !== except) send(c, msg);
   };
@@ -48,40 +94,45 @@ export function createSignalServer({
     const room = rooms.get(c.room);
     if (room && room.get(c.id) === c) {
       room.delete(c.id);
-      broadcast(room, { t: 'left', id: c.id });
+      broadcast(room, message(OUT.left, c.id));
       if (!room.size) rooms.delete(c.room);
     }
     c.room = null;
   }
 
-  function onMessage(c, raw) {
+  function onMessage(c, raw, isBinary) {
     const now = Date.now();
     c.tokens = Math.min(burst, c.tokens + (now - c.tokensAt) / 1000 * rate);
     c.tokensAt = now;
     if (--c.tokens < 0) { log('rate limit', c.ip); return c.ws.close(4008, 'rate'); }
-    let m;
-    try { m = JSON.parse(String(raw)); } catch { return; }
-    if (!m || typeof m !== 'object') return;
-
-    if (m.t === 'join') {
-      if (c.room || !ROOM_RE.test(m.room || '') || !ID_RE.test(m.id || '')) return c.ws.close(4001, 'bad join');
-      let room = rooms.get(m.room);
-      if (!room) rooms.set(m.room, room = new Map());
-      const old = room.get(m.id);
-      if (!old && room.size >= maxRoom) { send(c, { t: 'full' }); return c.ws.close(4002, 'full'); }
-      if (old) { old.room = null; room.delete(m.id); try { old.ws.close(4003, 'replaced'); } catch {} }  // перепідключення з тим самим id
-      c.room = m.room;
-      c.id = m.id;
-      send(c, { t: 'welcome', peers: [...room.keys()], ice: turnCreds() });
-      broadcast(room, { t: 'joined', id: c.id });
-      room.set(c.id, c);
-      return;
-    }
-    if (m.t === 'signal') {
-      const room = c.room && rooms.get(c.room);
-      const to = room && typeof m.to === 'string' && room.get(m.to);
-      if (to && to !== c && m.d && typeof m.d === 'object') send(to, { t: 'signal', from: c.id, d: m.d });
-    }
+    if (!isBinary) return c.ws.close(4005, 'version');          // старий текстовий (JSON) клієнт
+    const buf = Buffer.isBuffer(raw) ? raw : Array.isArray(raw) ? Buffer.concat(raw) : Buffer.from(raw);
+    const r = reader(buf);
+    try {
+      const type = r.u8();
+      if (type === IN.join) {
+        if (r.u8() !== PROTOCOL) return c.ws.close(4005, 'version');
+        const game = r.str(), roomId = r.str(), id = r.str();
+        if (c.room || !GAME_RE.test(game) || !ROOM_RE.test(roomId) || !ID_RE.test(id)) return c.ws.close(4001, 'bad join');
+        const key = `${game}/${roomId}`;                         // у кожної гри свої кімнати
+        let room = rooms.get(key);
+        if (!room) rooms.set(key, room = new Map());
+        const old = room.get(id);
+        if (!old && room.size >= maxRoom) { send(c, message(OUT.full)); return c.ws.close(4002, 'full'); }
+        if (old) { old.room = null; room.delete(id); try { old.ws.close(4003, 'replaced'); } catch {} }  // перепідключення з тим самим id
+        c.room = key;
+        c.id = id;
+        const ice = turnCreds();
+        send(c, message(OUT.welcome, [...room.keys()], varint(ice.length), ...ice.flatMap(s => [s.urls, s.username, s.credential])));
+        broadcast(room, message(OUT.joined, id));
+        room.set(id, c);
+      } else if (type === IN.signal) {
+        const toId = r.str(), d = r.rest();
+        const room = c.room && rooms.get(c.room);
+        const to = room && room.get(toId);
+        if (to && to !== c && d.length) send(to, message(OUT.signal, c.id, d));
+      }
+    } catch { /* обрізане повідомлення */ }
   }
 
   function handleConnection(ws, { ip = '?' } = {}) {
@@ -89,7 +140,7 @@ export function createSignalServer({
     if (n >= maxPerIp) { try { ws.close(4029, 'too many'); } catch {} return; }
     perIp.set(ip, n + 1);
     const c = { ws, ip, id: null, room: null, alive: true, tokens: burst, tokensAt: Date.now() };
-    ws.on('message', (raw) => onMessage(c, raw));
+    ws.on('message', (raw, isBinary) => onMessage(c, raw, isBinary));
     ws.on('pong', () => { c.alive = true; });
     ws.on('close', () => {
       leave(c);
