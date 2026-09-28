@@ -306,7 +306,14 @@ function sampleClock(ht, from) {
 const sharedNow = () => Date.now() + (amHost() ? 0 : clockOffset);
 
 // ================= P2P =================
-const room = joinRoom({ appId: 'yurii-firefighters-v1' }, roomId);
+const TURN_URL = 'https://144-172-110-72.sslip.io/turn.php';
+let turnConfig;
+try {
+  const res = await fetch(TURN_URL, { signal: AbortSignal.timeout(4000) });
+  if (res.ok) turnConfig = (await res.json()).iceServers;
+} catch (e) { console.warn('TURN недоступний, працюємо без нього', e); }
+const room = joinRoom(turnConfig ? { appId: 'yurii-firefighters-v1', turnConfig }
+                                 : { appId: 'yurii-firefighters-v1' }, roomId);
 const helloA = room.makeAction('hello');
 const posA = room.makeAction('pos');
 const worldA = room.makeAction('world');
