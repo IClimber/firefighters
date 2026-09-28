@@ -57,6 +57,9 @@
   .sw { width: 11px; height: 11px; border-radius: 2px; display: inline-block; }
   .hint { margin-top: 6px; color: var(--muted); font-size: 12px; }
   .warn { display: block; margin-top: 4px; color: var(--fire); font-size: 12px; }
+  .net { display: flex; flex-wrap: wrap; gap: 2px 10px; margin-top: 4px; color: var(--muted); font-size: 12px; }
+  .net span { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+  .net .sw { border-radius: 50%; }
 
   .overlay {
     position: fixed; inset: 0; display: none;
@@ -89,7 +92,7 @@
     padding: 6px 10px; font-size: 12px;
     display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 4px 12px;
   }
-  .touch .status, .touch .legend { margin-top: 0; }
+  .touch .status, .touch .legend, .touch .net { margin-top: 0; }
   .touch #copy { padding: 4px 10px; }
   .touch .legend { gap: 2px 10px; justify-content: center; }
   .dpad {
@@ -127,6 +130,7 @@
     <button id="copy">Копіювати</button>
   </div>
   <div class="status" id="status">Підключення до кімнати…</div>
+  <div class="net" id="net" hidden></div>
   <div class="legend">
     <span><i class="sw" style="background:#4e8a38"></i>Ціла: <b id="nG">0</b></span>
     <span><i class="sw" style="background:#f07a22"></i>Горить: <b id="nF">0</b></span>
@@ -363,7 +367,7 @@ const STUN = [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun.cloud
 const KINDS = ['hello', 'pos', 'world', 'douse', 'restart', 'bye'];
 const BROADCAST = new Set(['hello', 'pos', 'world', 'bye']);   // розсилаються всім і ретранслюються
 
-// peerId -> пряме з'єднання { pc, dc, n (id спроби), open, remote, inCands, outCands, sent }
+// peerId -> пряме з'єднання { pc, dc, n (id спроби), open, remote, inCands, outCands, sent, stat (тип і пінг для HUD) }
 const links = new Map();
 let left = false;                // сторінку закривають (pagehide)
 function sendKind(kind, data, target) {
@@ -670,6 +674,34 @@ function onData(id, raw) {
   if (m.k === 'fwd') onFwd(m.d, { peerId: id });
   else if (KINDS.includes(m.k)) receive(m.k, m.d, id, false);
 }
+
+// Тип і затримка відкритих з'єднань — для HUD. Обрана ICE-пара: host з обох боків — локальна мережа,
+// relay з будь-якого боку — через TURN, інакше — напряму через NAT.
+async function linkStat(L) {
+  const stats = await L.pc.getStats();
+  let pair = null;
+  stats.forEach((s) => { if (s.type === 'transport' && s.selectedCandidatePairId) pair = stats.get(s.selectedCandidatePairId); });
+  if (!pair) stats.forEach((s) => { if (s.type === 'candidate-pair' && (s.selected || (s.nominated && s.state === 'succeeded'))) pair = s; });  // Firefox
+  const loc = pair && stats.get(pair.localCandidateId), rem = pair && stats.get(pair.remoteCandidateId);
+  if (!loc || !rem) return null;
+  const type = loc.candidateType === 'relay' ? (loc.relayProtocol === 'tls' ? 'TURN/TLS' : 'TURN')
+    : rem.candidateType === 'relay' ? 'TURN'
+    : loc.candidateType === 'host' && rem.candidateType === 'host' ? 'LAN' : 'P2P';
+  let rtt = isNum(pair.currentRoundTripTime) ? pair.currentRoundTripTime : null;
+  if (rtt === null && isNum(pair.totalRoundTripTime) && isNum(pair.responsesReceived)) {   // без currentRoundTripTime — середнє за інтервал
+    const dn = pair.responsesReceived - (L.rttN || 0);
+    if (dn > 0) rtt = (pair.totalRoundTripTime - (L.rttT || 0)) / dn;
+    L.rttN = pair.responsesReceived; L.rttT = pair.totalRoundTripTime;
+  }
+  return { type, rtt: rtt === null ? null : Math.round(rtt * 1000) };
+}
+setInterval(() => {
+  if (document.hidden) return;
+  for (const L of links.values()) {
+    if (!L.open) continue;
+    linkStat(L).then((st) => { if (links.get(L.id) === L) { L.stat = st; renderNet(); } }, () => {});
+  }
+}, 2000);
 
 // ---------- Сервер сигналізації ----------
 let ws = null, wsBackoff = 500, wsTimer = 0, welcomed = false, roomFull = false;
@@ -1019,6 +1051,7 @@ function updateHud() {
     : turnMissing ? TURN_MISSING : '';
   if (w) status += `<span class="warn">${w}</span>`;               // лише власні константні рядки
   document.getElementById('status').innerHTML = status;
+  renderNet();
 
   document.getElementById('waitOv').classList.toggle('show', !game.round);
   const longWait = !game.round && waitingForHost && !ready;
@@ -1035,6 +1068,30 @@ function updateHud() {
     document.getElementById('endText').textContent =
       `Вціліло ділянок: ${c.g} з ${N}. Погашено: ${c.x}. Згоріло: ${c.b}.`;
   }
+}
+// З'єднання з кожним гравцем (колір — його каска): тип і пінг або «через гравця», якщо прямого з'єднання немає
+let netKey = '';
+function renderNet() {
+  const now = performance.now();
+  const items = [];
+  for (const [id, p] of peers) {
+    if (!isLive(p, now)) continue;
+    const st = p.direct ? links.get(id)?.stat : null;
+    const text = !p.direct ? 'через гравця' : !st ? '…' : st.rtt === null ? st.type : `${st.type} ${st.rtt} мс`;
+    items.push([p.hasPos ? p.hue : null, text]);
+  }
+  const key = JSON.stringify(items);
+  if (key === netKey) return;                                      // без зайвих змін розміру HUD
+  netKey = key;
+  const el = document.getElementById('net');
+  el.hidden = !items.length;
+  el.replaceChildren(document.createTextNode('Зв\'язок:'), ...items.map(([hue, text]) => {
+    const s = document.createElement('span'), dot = document.createElement('i');
+    dot.className = 'sw';
+    dot.style.background = hue === null ? '#999' : `hsl(${hue} 75% 50%)`;
+    s.append(dot, text);
+    return s;
+  }));
 }
 updateHud();
 
